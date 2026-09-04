@@ -97,16 +97,14 @@ function Expand-Top {
         $entries = @($entries | Sort-Object -Property Bytes -Descending)
     }
 
+    # Emit each child line immediately followed by its own subtree, so the
+    # hierarchy stays unambiguous (children of sibling dirs don't mix).
     foreach ($e in $entries) {
         $note = if ($e.Full) { '' } else { ' (this level only)' }
         $lines.Add($Indent + '-' + ' `' + $e.Name + '`: ' + (Format-MB $e.Bytes) + ' MB' + $note)
-    }
-
-    if ($Level -lt $Levels) {
-        foreach ($e in $expanded) {
-            foreach ($dl in (Expand-Top -Path $e.Path -Level ($Level + 1) -Levels $Levels -Indent ($Indent + '    '))) {
-                $lines.Add($dl)
-            }
+        if ($e.Full) {
+            $sub = Expand-Top -Path $e.Path -Level ($Level + 1) -Levels $Levels -Indent ($Indent + '    ')
+            foreach ($dl in $sub) { $lines.Add($dl) }
         }
     }
     return [string[]]$lines
