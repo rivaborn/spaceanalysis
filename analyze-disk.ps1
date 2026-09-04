@@ -322,8 +322,8 @@ function Find-CleanupCandidates {
 $settings = Load-Settings -SettingsPath $Settings
 if ($settings) {
     if (-not $PSBoundParameters.ContainsKey('Root')   -and $settings.PSObject.Properties['root']   -and $settings.root)   { $Root   = [string]$settings.root }
-    if (-not $PSBoundParameters.ContainsKey('Top')    -and $settings.PSObject.Properties['top']    -and $settings.top)     { $Top    = [int]$settings.top }
-    if (-not $PSBoundParameters.ContainsKey('Depth')  -and $settings.PSObject.Properties['depth']  -and $settings.depth -ne 0) { $Depth = [int]$settings.depth }
+    if (-not $PSBoundParameters.ContainsKey('Top')    -and $settings.PSObject.Properties['top'])    { $Top    = [int]$settings.top }
+    if (-not $PSBoundParameters.ContainsKey('Depth')  -and $settings.PSObject.Properties['depth'])  { $Depth  = [int]$settings.depth }
     if (-not $PSBoundParameters.ContainsKey('Output') -and $settings.PSObject.Properties['output'] -and $settings.output) { $Output = [string]$settings.output }
 }
 
