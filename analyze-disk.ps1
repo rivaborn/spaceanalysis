@@ -35,7 +35,7 @@ if ($Help) {
 analyze-disk.ps1 - review disk space usage on this system and recommend ways to free up space (read-only).
 
 Usage:
-  powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 [-Root <path>] [-Top <n>] [-Depth <n>] [-Output <file>] [-Help]
+  powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 [-Root <path>] [-Top <n>] [-Depth <n>] [-Output <file>] [-Parallel] [-Telemetry] [-Help]
 
 Parameters:
   -Root         Path to analyze (default: C:\)
@@ -46,20 +46,28 @@ Parameters:
   -StatusFile   Path to the telemetry status JSON (default: status.json). Written only when -Telemetry is set.
   -ControlFile  Path to the control JSON an external process writes to issue stop/pause/resume + overrides (default: control.json). Read only when -Telemetry is set.
   -Telemetry    Enable live telemetry (status file) and control-file polling. When off, the script runs the same fast path as before.
-  -JsonReport   Path to write a machine-readable JSON run result (summary, topConsumers, cleanupCandidates, grandTotalMB, stopped). (default: none)
+  -JsonReport   Path to write a machine-readable JSON run result (summary, topConsumers, cleanupCandidates, grandTotalMB, grandTotalAllocMB, stopped). (default: none)
   -Parallel     Scan top-level branches concurrently via an in-process runspace pool ([System.Management.Automation.Runspaces]). WinDirStat-style multithreading. Default is serial.
   -Help         Show this help and exit
 
 Report sections:
-  System summary      host, PowerShell version, run date, drive free space
-  Top space consumers direct child directories of Root, ranked by recursive size
-  Drill-down          up to -Depth levels into the top consumers (bounded walk)
-  Cleanup candidates  well-known Windows waste locations with sizes and safe cleanup hints
+  System summary        host, PowerShell version, run date, drive free space
+  Top space consumers   direct child directories of Root, ranked by recursive size (logical and physical/allocated)
+  Drill-down            up to -Depth levels into the top consumers (bounded in-memory walk, at most 10 branches/level)
+  Cleanup candidates    well-known Windows waste locations with sizes and safe cleanup hints
 
-Methodology: metadata-only enumeration (file names + Length, file contents are
-never read); each analyzed directory is measured in ONE pass; only the largest
-branches are expanded, so runtime stays bounded instead of exhaustively
-scanning every directory.
+Methodology (WinDirStat-inspired, single-pass):
+  - Metadata-only enumeration via .NET DirectoryInfo.EnumerateFileSystemInfos
+    (no per-object PowerShell pipeline). File contents are never read.
+  - Each directory is measured in ONE pass; the resulting in-memory tree is
+    reused for ranking, drill-down, and grand total (no re-scans).
+  - Directory reparse points (junctions / symlinks) are skipped, matching
+    WinDirStat's default, to prevent loops and double-counting.
+  - Both logical size (file Length) and physical/allocated size
+    (GetCompressedFileSizeW) are reported; physical size is what actually
+    frees space, which matters for sparse or NTFS-compressed files.
+  - With -Parallel, top-level branches are walked concurrently in an in-process
+    runspace pool; the merged result is identical to the serial scan.
 
 Safety: the script is strictly read-only. It reports and suggests; it never
 modifies or deletes anything.

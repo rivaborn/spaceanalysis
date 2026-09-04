@@ -3,7 +3,10 @@
 `analyze-disk.ps1` reviews disk space usage on a Windows system and recommends
 ways to free up space. It is a PowerShell script that is **strictly
 read-only**: it reports sizes and suggests cleanups, but never modifies or
-deletes anything.
+deletes anything. The methodology is WinDirStat-inspired: a single-pass,
+metadata-only tree walk with reparse-point (junction/symlink) skipping,
+dual logical/physical (allocated) size reporting, and optional parallel
+scanning of top-level branches.
 
 ## What it produces
 
@@ -12,11 +15,13 @@ A single cohesive markdown report with four sections:
 1. **System summary** — host name, PowerShell version, run date, root, top-N
    and depth settings, and the drive's total/used/free space.
 2. **Top space consumers** — the root's direct child directories ranked by
-   recursive size, descending.
-3. **Drill-down** — a bounded walk into the top consumers (up to `-Depth`
-   levels, at most 10 branches expanded per level) showing which
+   recursive size, descending. Both logical size and physical (allocated)
+   size are shown in MB; physical reflects actual on-disk usage (matters for
+   sparse and NTFS-compressed files).
+3. **Drill-down** — a bounded in-memory walk into the top consumers (up to
+   `-Depth` levels, at most 10 branches expanded per level) showing which
    subdirectories drive the big usage. Branches that were not expanded
-   recursively are marked `(this level only)`.
+   recursively are marked `(this level only)`. No disk re-scan is performed.
 4. **Cleanup candidates** — well-known Windows waste locations (user TEMP,
    Windows Temp, Recycle Bin, Windows Update download cache, Windows
    Installer, pip/npm/NuGet caches) with their reclaimable size and a
@@ -28,21 +33,35 @@ written to that file (UTF-8).
 
 ## Efficient methodology
 
-Reading every file and folder on a drive can take hours. Instead:
+Reading every file and folder on a drive can take hours. The script uses a
+WinDirStat-inspired, single-pass approach:
 
-- **Metadata only.** The script enumerates file names and sizes (`Length`).
-  File contents are never opened, so a recursive pass is just a metadata
-  walk — orders of magnitude faster than reading data.
-- **One pass per analyzed directory.** Each measured directory is scanned
-  exactly once with
-  `Get-ChildItem -File -Recurse | Measure-Object Length`; nothing is
-  re-scanned to compute the grand total (it is derived from the per-directory
-  measurements plus the root's loose files).
+- **Metadata only.** The script enumerates file names and sizes via the .NET
+  `DirectoryInfo.EnumerateFileSystemInfos` iterator (no per-object PowerShell
+  pipeline). File contents are never opened, so a recursive pass is just a
+  metadata walk — orders of magnitude faster than reading data.
+- **Single-pass tree (scan-once).** Each top-level directory is walked exactly
+  once, building an in-memory tree of nodes (Name, Path, OwnBytes, TotalBytes,
+  TotalAllocBytes, FileCount, Children). Ranking, drill-down, and the grand
+  total all read from this tree — no disk re-scans.
+- **Reparse-point / junction skipping.** Directory reparse points (junctions
+  and symbolic links) are skipped, matching WinDirStat's default, to prevent
+  loops and double-counting. This applies at every level of the tree, including
+  top-level entries under the scan root.
+- **Physical (allocated) size.** Alongside the logical file size (`Length`),
+  the script queries `GetCompressedFileSizeW` (via P/Invoke) to report the
+  on-disk allocated size. For sparse or NTFS-compressed files the physical
+  size is smaller; for normal files it is approximately equal. Physical size
+  is what actually frees space.
 - **Top-down, bounded drill-down.** Direct children of the root are ranked
   first; only the largest consumers are expanded, at most 10 per level, up
   to `-Depth` levels. Smaller branches are shown with a cheap
   non-recursive size. This finds the big space hogs without an exhaustive
   full-tree scan, keeping runtime bounded.
+- **Optional parallel scanning (`-Parallel`).** Top-level branches are walked
+  concurrently in an in-process runspace pool
+  (`[System.Management.Automation.Runspaces]`), mirroring WinDirStat's
+  multithreading. The merged result is byte-identical to the serial scan.
 
 ## Usage
 
@@ -54,6 +73,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 `
   -Root 'C:\Users\folar' -Top 10 -Depth 3 -Output .\report.md
 
+# Parallel scan of top-level branches
+powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 `
+  -Root 'C:\' -Top 20 -Depth 2 -Parallel
+
 # Show help
 powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 -Help
 ```
@@ -64,6 +87,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 -Help
 | `-Top` | `20` | Number of top-level consumers to rank and drill into. |
 | `-Depth` | `2` | Drill-down depth into top consumers, in levels. |
 | `-Output` | none | Also write the markdown report to this file. |
+| `-Parallel` | off | Scan top-level branches concurrently via an in-process runspace pool. |
 | `-Help` | | Print usage and exit. |
 
 ## CLI / automation
@@ -186,14 +210,15 @@ Written after the markdown report is emitted (or skipped on early stop).
     "date": "2026-09-04T04:52:54.0000000-04:00"
   },
   "topConsumers": [
-    { "name": "Windows", "sizeMB": 24530.12 },
-    { "name": "Users",   "sizeMB":  18432.55 }
+    { "name": "Windows", "sizeMB": 24530.12, "allocMB": 23901.4 },
+    { "name": "Users",   "sizeMB":  18432.55, "allocMB": 18102.3 }
   ],
   "cleanupCandidates": [
     { "label": "User TEMP (C:\\Users\\folar\\AppData\\Local\\Temp)", "mb": 1024.5, "present": true },
     { "label": "Recycle Bin", "mb": 0, "present": false }
   ],
   "grandTotalMB": 48210.77,
+  "grandTotalAllocMB": 47500.3,
   "stopped": false
 }
 ```
@@ -239,7 +264,12 @@ echo '{"action":"resume"}' > "$ROOT/control.json"
 
 ## Safety
 
-The script performs **no deletion or modification** of any kind. The cleanup
-hints in the report (e.g. `Remove-Item ... -Recurse -Force`,
-`Clear-RecycleBin`) are suggestions only — review them before running them,
-since they are destructive when executed.
+The script performs **no deletion or modification** of any kind. It is a
+single-shot, read-only process that only enumerates file-system metadata and
+reports results. The cleanup hints in the report (e.g.
+`Remove-Item ... -Recurse -Force`, `Clear-RecycleBin`) are suggestions only —
+review them before running them, since they are destructive when executed.
+
+The script also does not follow directory reparse points (junctions and
+symbolic links), so it will never loop or double-count a path that is
+reachable through multiple links.
