@@ -26,7 +26,8 @@ param(
     [string]$StatusFile = 'status.json',
     [string]$ControlFile = 'control.json',
     [switch]$Telemetry,
-    [string]$JsonReport = $null
+    [string]$JsonReport = $null,
+    [switch]$Parallel
 )
 
 if ($Help) {
@@ -46,6 +47,7 @@ Parameters:
   -ControlFile  Path to the control JSON an external process writes to issue stop/pause/resume + overrides (default: control.json). Read only when -Telemetry is set.
   -Telemetry    Enable live telemetry (status file) and control-file polling. When off, the script runs the same fast path as before.
   -JsonReport   Path to write a machine-readable JSON run result (summary, topConsumers, cleanupCandidates, grandTotalMB, stopped). (default: none)
+  -Parallel     Scan top-level branches concurrently via an in-process runspace pool ([System.Management.Automation.Runspaces]). WinDirStat-style multithreading. Default is serial.
   -Help         Show this help and exit
 
 Report sections:
@@ -476,6 +478,111 @@ function Expand-Tree {
     return [string[]]$lines
 }
 
+function Invoke-ParallelBranches {
+    <#
+    .SYNOPSIS
+        Scans multiple top-level directories concurrently using an in-process runspace pool.
+
+    .DESCRIPTION
+        Mirrors WinDirStat's multithreading: each top-level branch is walked in a
+        separate in-process runspace via [System.Management.Automation.Runspaces].
+        Results are merged back into a single ordered array of tree nodes.
+        The P/Invoke type is shared across runspaces (same AppDomain), so no
+        re-compilation is needed in the workers.
+    #>
+    param([string[]]$Paths)
+
+    if ($Paths.Count -le 1) {
+        $nodes = @()
+        foreach ($p in $Paths) {
+            $nodes += (Get-SizeTreeNode -Path $p)
+        }
+        return $nodes
+    }
+
+    # Extract function source to embed in the worker script.
+    # In PS 5.1, (Get-Command fn).Definition returns the body without the 'function Name {' wrapper.
+    $physFn = (Get-Command Get-PhysicalSize).Definition
+    $treeFn = (Get-Command Get-SizeTreeNode).Definition
+
+    # Build a self-contained worker script.
+    # [Win32.FileSizeApi] is already loaded in this process (shared AppDomain),
+    # so workers reference it directly without re-adding the P/Invoke type.
+    $scriptLines = @(
+        'param([string]$BranchPath)',
+        '$Win32_FileSize = [Win32.FileSizeApi]',
+        'function Get-PhysicalSize {',
+        $physFn,
+        '}',
+        'function Get-SizeTreeNode {',
+        $treeFn,
+        '}',
+        'Get-SizeTreeNode -Path $BranchPath'
+    )
+    $workerScript = [string]::Join("`n", $scriptLines)
+
+    # Create an in-process runspace pool.
+    # PS 5.1: use the 2-arg overload CreateRunspacePool(int,int) — the 3-arg form
+    # expects a PSHost, not ApartmentState, and is ambiguous in this build.
+    $maxConcurrent = [Math]::Min([Environment]::ProcessorCount, 8)
+    $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxConcurrent)
+    $runspacePool.Open()
+
+    $nodes = [object[]]::new($Paths.Count)
+    $psInstances = @()
+
+    try {
+        # Submit all branch scans to the pool (concurrency limited by pool size).
+        for ($i = 0; $i -lt $Paths.Count; $i++) {
+            $ps = [PowerShell]::Create()
+            $ps.RunspacePool = $runspacePool
+            [void]$ps.AddScript($workerScript)
+            [void]$ps.AddArgument($Paths[$i])
+            $ar = $ps.BeginInvoke()
+            $psInstances += ,@($i, $ps, $ar)
+        }
+
+        # Collect results in original order.
+        foreach ($entry in $psInstances) {
+            $idx = $entry[0]
+            $ps  = $entry[1]
+            $ar  = $entry[2]
+            try {
+                $result = @($ps.EndInvoke($ar))
+                foreach ($err in $ps.Streams.Error) { Write-Warning "Parallel scan of $($Paths[$idx]): $err" }
+                if ($result.Count -gt 0 -and $null -ne $result[0]) {
+                    $nodes[$idx] = $result[0]
+                } else {
+                    Write-Warning "Parallel scan of $($Paths[$idx]) returned no result."
+                    $nodes[$idx] = [pscustomobject]@{
+                        Name = [System.IO.Path]::GetFileName($Paths[$idx])
+                        Path = $Paths[$idx]
+                        OwnBytes = 0L; TotalBytes = 0L
+                        OwnAllocBytes = 0L; TotalAllocBytes = 0L
+                        FileCount = 0L; Children = @()
+                    }
+                }
+            } catch {
+                Write-Warning "Parallel scan of $($Paths[$idx]) failed: $_"
+                $nodes[$idx] = [pscustomobject]@{
+                    Name = [System.IO.Path]::GetFileName($Paths[$idx])
+                    Path = $Paths[$idx]
+                    OwnBytes = 0L; TotalBytes = 0L
+                    OwnAllocBytes = 0L; TotalAllocBytes = 0L
+                    FileCount = 0L; Children = @()
+                }
+            }
+            $ps.Dispose()
+        }
+    }
+    finally {
+        $runspacePool.Close()
+        $runspacePool.Dispose()
+    }
+
+    return @($nodes)
+}
+
 function Find-CleanupCandidates {
     <#
     .SYNOPSIS
@@ -614,16 +721,34 @@ Write-Status -Phase 'top-scan-start' -ItemsTotal $totalDirs -Message ('Scanning 
 $Script:WalkBytes = [long]0
 $Script:WalkFiles = [long]0
 
-$topNodes = @()
-$done = 0
-foreach ($child in $rootDirs) {
-    if ($Script:StopRequested) { break }
-    $done++
-    Write-Status -Phase 'top-scan' -Current $child.Name -ItemsDone $done -ItemsTotal $totalDirs -Message ('Measuring `' + $child.Name + '`')
-    $node = Get-SizeTreeNode -Path $child.FullName -Track:$Script:TelemetryOn -Label $child.Name
-    $topNodes += $node
-    # Checkpoint at each directory boundary: honor stop / pause / overrides.
-    Read-Control
+if ($Parallel -and $rootDirs.Count -gt 1) {
+    # --- Parallel path: scan branches concurrently via an in-process runspace pool ---
+    $branchPaths = @($rootDirs | ForEach-Object { $_.FullName })
+    $maxJobs = [Environment]::ProcessorCount
+    if ($maxJobs -gt 8) { $maxJobs = 8 }
+    Write-Host "[parallel] Scanning $totalDirs branches concurrently (max $maxJobs workers)"
+    $topNodes = Invoke-ParallelBranches -Paths $branchPaths
+    $done = $totalDirs
+    # Compute telemetry totals from the returned nodes.
+    $Script:WalkBytes = [long]0
+    $Script:WalkFiles = [long]0
+    foreach ($n in $topNodes) {
+        $Script:WalkBytes += [long]$n.TotalBytes
+        $Script:WalkFiles += [long]$n.FileCount
+    }
+} else {
+    # --- Serial path (default): walk each top-level branch in order ---
+    $topNodes = @()
+    $done = 0
+    foreach ($child in $rootDirs) {
+        if ($Script:StopRequested) { break }
+        $done++
+        Write-Status -Phase 'top-scan' -Current $child.Name -ItemsDone $done -ItemsTotal $totalDirs -Message ('Measuring `' + $child.Name + '`')
+        $node = Get-SizeTreeNode -Path $child.FullName -Track:$Script:TelemetryOn -Label $child.Name
+        $topNodes += $node
+        # Checkpoint at each directory boundary: honor stop / pause / overrides.
+        Read-Control
+    }
 }
 Write-Status -Phase 'top-scan-done' -ItemsDone $done -ItemsTotal $totalDirs -Message "Top-level scan complete ($done/$totalDirs measured)"
 Read-Control
