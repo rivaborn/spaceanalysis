@@ -10,6 +10,9 @@
 #     pipeline), skipping directory reparse points (junctions / symlinks).
 #   - We rank the top consumers and (in later steps) drill into only the
 #     largest ones, instead of doing an exhaustive full-tree scan.
+#   - Physical (allocated) size is reported alongside logical size via
+#     GetCompressedFileSizeW, matching WinDirStat's logical-vs-physical
+#     distinction — physical size is what actually frees space.
 #
 # Read-only: this script never modifies or deletes anything.
 
@@ -62,6 +65,51 @@ modifies or deletes anything.
     exit 0
 }
 
+# ============================================================
+# P/Invoke for physical (allocated / on-disk) file size
+# ============================================================
+
+$Win32_FileSize = $null
+try {
+    $Win32_FileSize = Add-Type -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern uint GetCompressedFileSizeW(string lpFileName, out uint pFileSizeHigh);
+'@ -Namespace Win32 -Name FileSizeApi -ErrorAction Stop -PassThru
+} catch {
+    # Add-Type failed (e.g. no C# compiler); fall back gracefully.
+    $Win32_FileSize = $null
+}
+
+function Get-PhysicalSize {
+    <#
+    .SYNOPSIS
+        Returns the on-disk (physical / allocated / compressed) size of a file in bytes.
+
+    .DESCRIPTION
+        Uses kernel32 GetCompressedFileSizeW via P/Invoke. Falls back to the
+        logical Length if the call fails or is unavailable. For most normal
+        files physical == logical; for sparse or NTFS-compressed files it is
+        lower, and for files rounded up to the cluster boundary it may be
+        slightly higher.
+    #>
+    param([string]$Path)
+
+    if ($null -eq $Win32_FileSize) { return -1 }  # P/Invoke unavailable; caller falls back to logical
+    try {
+        $high = [uint32]0
+        $low  = $Win32_FileSize::GetCompressedFileSizeW($Path, [ref]$high)
+        if ($high -eq 0) {
+            # File < 4 GB: low-order DWORD is the full physical size.
+            if ($low -eq 0xFFFFFFFF) { return -1 }  # INVALID_FILE_SIZE
+            return [long]$low
+        } else {
+            return ([long]$high -shl 32) -bor [long]$low
+        }
+    } catch {
+        return -1
+    }
+}
+
 function Get-DirSize {
     <#
     .SYNOPSIS
@@ -91,8 +139,9 @@ function Get-DirSize {
 
     # Working accumulators for this single walk, reset per Get-DirSize call so
     # the global Script: totals are added exactly once (never per level).
-    $Script:WalkBytes = [long]0
-    $Script:WalkFiles = [long]0
+    $Script:WalkBytes       = [long]0
+    $Script:WalkAllocBytes  = [long]0
+    $Script:WalkFiles       = [long]0
 
     [void](Get-DirSizeWalk -Path $Path -Track:$Track -Label $Label)
 
@@ -100,7 +149,7 @@ function Get-DirSize {
     $files = [long]$Script:WalkFiles
 
     if ($Track) {
-        $Script:FilesCounted += $files
+        $Script:FilesCounted  += $files
         $Script:BytesCounted  += $bytes
     }
     return $bytes
@@ -136,7 +185,13 @@ function Get-DirSizeWalk {
             if ($Track -and $Script:StopRequested) { break }
 
             if ($e -is [System.IO.FileInfo]) {
-                try { $Script:WalkBytes += [long]$e.Length } catch {}
+                $len = 0L
+                try { $len = [long]$e.Length } catch {}
+                $Script:WalkBytes += $len
+                # Physical (allocated) size via GetCompressedFileSizeW.
+                $phys = Get-PhysicalSize -Path $e.FullName
+                if ($phys -lt 0) { $phys = $len }  # fallback to logical
+                $Script:WalkAllocBytes += $phys
                 if ($Track) {
                     $Script:WalkFiles++
                     if ($Script:WalkFiles % $statusEvery -eq 0) {
@@ -179,10 +234,11 @@ function Get-SizeTreeNode {
         [string]$Label = ''
     )
 
-    $reparseFlag = [int][System.IO.FileAttributes]::ReparsePoint
-    $ownBytes    = [long]0
-    $fileCount   = [long]0
-    $childNodes  = [System.Collections.Generic.List[object]]::new()
+    $reparseFlag  = [int][System.IO.FileAttributes]::ReparsePoint
+    $ownBytes     = [long]0
+    $ownAllocBytes = [long]0
+    $fileCount    = [long]0
+    $childNodes   = [System.Collections.Generic.List[object]]::new()
 
     try {
         foreach ($e in [System.IO.DirectoryInfo]::new($Path).EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
@@ -191,7 +247,11 @@ function Get-SizeTreeNode {
             if ($e -is [System.IO.FileInfo]) {
                 $len = 0L
                 try { $len = [long]$e.Length } catch {}
-                $ownBytes  += $len
+                $ownBytes += $len
+                # Physical (allocated) size via GetCompressedFileSizeW.
+                $phys = Get-PhysicalSize -Path $e.FullName
+                if ($phys -lt 0) { $phys = $len }
+                $ownAllocBytes += $phys
                 $fileCount++
                 if ($Track) {
                     $Script:WalkFiles++
@@ -219,19 +279,25 @@ function Get-SizeTreeNode {
     # Sort children by TotalBytes descending (most significant first).
     $children = @($childNodes | Sort-Object -Property TotalBytes -Descending)
 
-    $totalBytes = $ownBytes
-    foreach ($c in $children) { $totalBytes += [long]$c.TotalBytes }
+    $totalBytes     = $ownBytes
+    $totalAllocBytes = $ownAllocBytes
+    foreach ($c in $children) {
+        $totalBytes      += [long]$c.TotalBytes
+        $totalAllocBytes += [long]$c.TotalAllocBytes
+    }
 
     $name = [System.IO.Path]::GetFileName($Path)
     if ($name -eq '') { $name = $Path }
 
     return [pscustomobject]@{
-        Name       = $name
-        Path       = $Path
-        OwnBytes   = $ownBytes
-        TotalBytes = $totalBytes
-        FileCount  = $fileCount
-        Children   = $children
+        Name          = $name
+        Path          = $Path
+        OwnBytes      = $ownBytes
+        TotalBytes    = $totalBytes
+        OwnAllocBytes = $ownAllocBytes
+        TotalAllocBytes = $totalAllocBytes
+        FileCount     = $fileCount
+        Children      = $children
     }
 }
 
@@ -399,8 +465,9 @@ function Expand-Tree {
         $isFull = $expandedSet.ContainsKey($e.Path)
         $note = if ($isFull) { '' } else { ' (this level only)' }
         # Expanded: show TotalBytes (full recursive). Non-expanded: show OwnBytes (this level only).
-        $displayBytes = if ($isFull) { [long]$e.TotalBytes } else { [long]$e.OwnBytes }
-        $lines.Add($Indent + '- `' + $e.Name + '`: ' + (Format-MB $displayBytes) + ' MB' + $note)
+        $displayBytes    = if ($isFull) { [long]$e.TotalBytes }      else { [long]$e.OwnBytes }
+        $displayAlloc    = if ($isFull) { [long]$e.TotalAllocBytes } else { [long]$e.OwnAllocBytes }
+        $lines.Add($Indent + '- `' + $e.Name + '`: ' + (Format-MB $displayBytes) + ' MB / ' + (Format-MB $displayAlloc) + ' MB alloc' + $note)
         if ($isFull) {
             $sub = Expand-Tree -Node $e -Level ($Level + 1) -Levels $Levels -Indent ($Indent + '    ')
             foreach ($dl in $sub) { $lines.Add($dl) }
@@ -533,8 +600,8 @@ $report.Add('')
 # --- Ranked top space consumers (direct child directories of $Root) ---
 $report.Add('## Top space consumers under `' + $Root + '`')
 $report.Add('')
-$report.Add('| Directory | Size (MB) |')
-$report.Add('| --- | ---: |')
+$report.Add('| Directory | Logical (MB) | Physical (MB) |')
+$report.Add('| --- | ---: | ---: |')
 
 # Single-pass tree build: each top-level directory is walked ONCE by
 # Get-SizeTreeNode (no re-scanning for drill-down). The in-memory tree is
@@ -579,7 +646,7 @@ if ($Script:StopRequested) {
 $effectiveTop = if ($Script:OverrideTop -and $Script:OverrideTop -gt 0) { $Script:OverrideTop } else { $Top }
 $topN = @($ranked | Select-Object -First $effectiveTop)
 foreach ($item in $topN) {
-    $line = '| `' + $item.Name + '` | ' + (Format-MB $item.TotalBytes) + ' |'
+    $line = '| `' + $item.Name + '` | ' + (Format-MB $item.TotalBytes) + ' | ' + (Format-MB $item.TotalAllocBytes) + ' |'
     $report.Add($line)
 }
 
@@ -620,11 +687,17 @@ foreach ($c in $candidates) {
 $report.Add('')
 
 # Grand total = root's own files + all top-level node totals (from the tree).
-$rootOwnBytes = [long]0
+$rootOwnBytes     = [long]0
+$rootOwnAllocBytes = [long]0
 try {
     foreach ($e in [System.IO.DirectoryInfo]::new($Root).EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
         if ($e -is [System.IO.FileInfo]) {
-            try { $rootOwnBytes += [long]$e.Length } catch {}
+            $len = 0L
+            try { $len = [long]$e.Length } catch {}
+            $rootOwnBytes += $len
+            $phys = Get-PhysicalSize -Path $e.FullName
+            if ($phys -lt 0) { $phys = $len }
+            $rootOwnAllocBytes += $phys
         }
     }
 } catch {}
@@ -632,7 +705,11 @@ $grandTotalBytes = $rootOwnBytes
 foreach ($item in $ranked) { $grandTotalBytes += [long]$item.TotalBytes }
 
 $report.Add('')
-$report.Add('Total under `' + $Root + '`: ' + (Format-MB $grandTotalBytes) + ' MB (' + $grandTotalBytes + ' bytes)')
+# Grand total physical (allocated) bytes from tree nodes + root loose files.
+$grandTotalAllocBytes = $rootOwnAllocBytes
+foreach ($item in $ranked) { $grandTotalAllocBytes += [long]$item.TotalAllocBytes }
+
+$report.Add('Total under `' + $Root + '`: ' + (Format-MB $grandTotalBytes) + ' MB logical / ' + (Format-MB $grandTotalAllocBytes) + ' MB physical (' + $grandTotalBytes + ' bytes)')
 
 # --- Emit report: console, and to -Output file when given ---
 $text = $report -join [System.Environment]::NewLine
@@ -655,16 +732,18 @@ if ($JsonReport) {
             date   = [DateTime]::Now.ToString('o')
         }
         topConsumers = @($topN | ForEach-Object { [ordered]@{
-            name   = $_.Name
-            sizeMB = [math]::Round([long]$_.TotalBytes / 1MB, 2)
+            name        = $_.Name
+            sizeMB      = [math]::Round([long]$_.TotalBytes / 1MB, 2)
+            allocMB     = [math]::Round([long]$_.TotalAllocBytes / 1MB, 2)
         } })
         cleanupCandidates = @($candidates | ForEach-Object { [ordered]@{
             label   = $_.Label
             mb      = [math]::Round([long]$_.Bytes / 1MB, 2)
             present = [bool]$_.Present
         } })
-        grandTotalMB = [math]::Round([long]$grandTotalBytes / 1MB, 2)
-        stopped      = [bool]$Script:StopRequested
+        grandTotalMB      = [math]::Round([long]$grandTotalBytes / 1MB, 2)
+        grandTotalAllocMB = [math]::Round([long]$grandTotalAllocBytes / 1MB, 2)
+        stopped           = [bool]$Script:StopRequested
     }
     $jsonStr = $jsonReportData | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($JsonReport, $jsonStr, [System.Text.UTF8Encoding]::new($false))
