@@ -21,7 +21,8 @@ param(
     [string]$Settings = $null,
     [string]$StatusFile = 'status.json',
     [string]$ControlFile = 'control.json',
-    [switch]$Telemetry
+    [switch]$Telemetry,
+    [string]$JsonReport = $null
 )
 
 if ($Help) {
@@ -32,11 +33,16 @@ Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 [-Root <path>] [-Top <n>] [-Depth <n>] [-Output <file>] [-Help]
 
 Parameters:
-  -Root     Path to analyze (default: C:\)
-  -Top      Number of top-level consumers to rank and drill into (default: 20)
-  -Depth    Drill-down depth into top consumers, in levels (default: 2)
-  -Output   Write the markdown report to this file in addition to the console (default: none)
-  -Help     Show this help and exit
+  -Root         Path to analyze (default: C:\)
+  -Top          Number of top-level consumers to rank and drill into (default: 20)
+  -Depth        Drill-down depth into top consumers, in levels (default: 2)
+  -Output       Write the markdown report to this file in addition to the console (default: none)
+  -Settings     Path to a JSON run-config file written by another process; CLI params take precedence (default: none)
+  -StatusFile   Path to the telemetry status JSON (default: status.json). Written only when -Telemetry is set.
+  -ControlFile  Path to the control JSON an external process writes to issue stop/pause/resume + overrides (default: control.json). Read only when -Telemetry is set.
+  -Telemetry    Enable live telemetry (status file) and control-file polling. When off, the script runs the same fast path as before.
+  -JsonReport   Path to write a machine-readable JSON run result (summary, topConsumers, cleanupCandidates, grandTotalMB, stopped). (default: none)
+  -Help         Show this help and exit
 
 Report sections:
   System summary      host, PowerShell version, run date, drive free space
@@ -140,7 +146,7 @@ function Load-Settings {
     if (-not $SettingsPath) { return $null }
     if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) { return $null }
     try {
-        $raw = Get-Content -LiteralPath $SettingsPath -Raw -ErrorAction Stop
+        $raw = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $SettingsPath).Path)
         return ($raw | ConvertFrom-Json)
     } catch {
         Write-Warning "Could not parse settings file '$SettingsPath': $($_.Exception.Message)"
@@ -358,12 +364,20 @@ function Find-CleanupCandidates {
 }
 
 # --- Load settings file (another process can pre-configure the run) ---
-$settings = Load-Settings -SettingsPath $Settings
-if ($settings) {
-    if (-not $PSBoundParameters.ContainsKey('Root')   -and $settings.PSObject.Properties['root']   -and $settings.root)   { $Root   = [string]$settings.root }
-    if (-not $PSBoundParameters.ContainsKey('Top')    -and $settings.PSObject.Properties['top'])    { $Top    = [int]$settings.top }
-    if (-not $PSBoundParameters.ContainsKey('Depth')  -and $settings.PSObject.Properties['depth'])  { $Depth  = [int]$settings.depth }
-    if (-not $PSBoundParameters.ContainsKey('Output') -and $settings.PSObject.Properties['output'] -and $settings.output) { $Output = [string]$settings.output }
+$cfg = $null
+if ($Settings -and (Test-Path -LiteralPath $Settings -PathType Leaf)) {
+    try {
+        $raw = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $Settings).Path)
+        $cfg = $raw | ConvertFrom-Json
+    } catch {
+        Write-Warning "Could not parse settings file '$Settings': $($_.Exception.Message)"
+    }
+}
+if ($cfg) {
+    if (-not $PSBoundParameters.ContainsKey('Root')   -and $null -ne $cfg.root   -and $cfg.root   -ne '') { $Root   = [string]$cfg.root }
+    if (-not $PSBoundParameters.ContainsKey('Top')    -and $null -ne $cfg.top)                                { $Top    = [int]$cfg.top }
+    if (-not $PSBoundParameters.ContainsKey('Depth')  -and $null -ne $cfg.depth)                               { $Depth  = [int]$cfg.depth }
+    if (-not $PSBoundParameters.ContainsKey('Output') -and $null -ne $cfg.output -and $cfg.output -ne '') { $Output = [string]$cfg.output }
 }
 
 # --- Telemetry / control runtime state (script scope) ---
@@ -526,3 +540,29 @@ if ($Output) {
 # --- Terminal heartbeat (telemetry) ---
 Write-Status -Phase 'done' -ItemsDone $done -ItemsTotal $totalDirs -Files $Script:FilesCounted -Bytes $Script:BytesCounted -Message 'Report generated.'
 Write-Output $text
+
+# --- Machine-readable JSON report (-JsonReport) ---
+if ($JsonReport) {
+    $jsonReportData = [ordered]@{
+        summary = [ordered]@{
+            topN   = $effectiveTop
+            root   = $Root
+            host   = $env:COMPUTERNAME
+            date   = [DateTime]::Now.ToString('o')
+        }
+        topConsumers = @($topN | ForEach-Object { [ordered]@{
+            name   = $_.Name
+            sizeMB = [math]::Round([long]$_.Bytes / 1MB, 2)
+        } })
+        cleanupCandidates = @($candidates | ForEach-Object { [ordered]@{
+            label   = $_.Label
+            mb      = [math]::Round([long]$_.Bytes / 1MB, 2)
+            present = [bool]$_.Present
+        } })
+        grandTotalMB = [math]::Round([long]$grandTotalBytes / 1MB, 2)
+        stopped      = [bool]$Script:StopRequested
+    }
+    $jsonStr = $jsonReportData | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText($JsonReport, $jsonStr, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "JSON report written to $JsonReport"
+}

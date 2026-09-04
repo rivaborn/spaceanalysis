@@ -66,6 +66,177 @@ powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 -Help
 | `-Output` | none | Also write the markdown report to this file. |
 | `-Help` | | Print usage and exit. |
 
+## CLI / automation
+
+Besides the basic scan parameters, the script exposes four parameters that let
+an external process pre-configure or observe a run through plain JSON files on
+the filesystem. No pipes, sockets, or daemons are needed — the script is a
+single-shot, single-threaded process, so file-based JSON is the natural IPC.
+
+### Parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `-Settings <json>` | none | Path to a JSON run-config file (see schema below). CLI parameters take precedence over settings-file values. |
+| `-StatusFile <json>` | `status.json` | Where the script writes live telemetry (see schema below). Written **only** when `-Telemetry` is set. |
+| `-ControlFile <json>` | `control.json` | Where an external process writes control actions (see schema below). Read **only** when `-Telemetry` is set. |
+| `-Telemetry` | off | Switch. When set, the script writes the status file and polls the control file at directory boundaries and every 20 000 files during a scan. |
+| `-JsonReport <file>` | none | Path for a machine-readable JSON run result (see schema below). Written after the markdown report is emitted. |
+
+### `settings.json` — run configuration
+
+An external process writes this file **before** launching the script. Only
+keys that are present are applied; any key the CLI already specifies is
+ignored (CLI wins).
+
+```json
+{
+  "root":  "C:\",
+  "top":   20,
+  "depth": 2,
+  "output": "C:\reports\disk.md"
+}
+```
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `root` | string | Path to analyze. Must exist. |
+| `top` | int | Number of top-level consumers. |
+| `depth` | int | Drill-down depth. `0` disables drill-down. |
+| `output` | string | Extra output path for the markdown report. |
+
+`jsonReport` is **not** read from settings.json; use the `-JsonReport` CLI
+flag instead.
+
+### `control.json` — actions (written by an external process)
+
+The script reads this file at every top-level directory boundary and every
+20 000 files during a tracked scan. It is non-blocking: the script never
+waits for the file to exist.
+
+```json
+{ "action": "stop" }
+```
+
+| `action` value | Effect |
+| --- | --- |
+| `stop` | Script writes a terminal `stopped` status and exits early (code 0). No report is generated. |
+| `pause` | Script blocks, polling every 1 s, until the file says `resume` or `stop`. |
+| `resume` | Clears the pause; script continues. |
+
+The file may also carry optional overrides (applied when the key is present):
+
+```json
+{ "action": "pause", "depth": 3, "top": 5 }
+```
+
+| Key | Type | Effect |
+| --- | --- | --- |
+| `depth` | int | Overrides drill-down depth for the remainder of the run. |
+| `top` | int | Overrides the top-N count. |
+
+Delete or truncate the file to reset; the script simply skips missing or
+empty files.
+
+### `status.json` — live telemetry (written by the script)
+
+Written atomically (write to `.tmp`, then rename) so a poller never sees a
+partial document. Only written when `-Telemetry` is set.
+
+```json
+{
+  "pid": 12345,
+  "startTime": "2026-09-04T04:42:14.0645899-04:00",
+  "timestamp": "2026-09-04T04:42:46.8283503-04:00",
+  "phase": "measuring",
+  "current": "Windows",
+  "itemsDone": 1,
+  "itemsTotal": 32,
+  "bytesCounted": 10737418240,
+  "filesCounted": 45000,
+  "elapsedSeconds": 32.8,
+  "message": "Measuring Windows : 45000 files, 10737418240 bytes"
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `pid` | int | PID of the PowerShell process. |
+| `startTime` | string (ISO 8601) | When the run started. |
+| `timestamp` | string (ISO 8601) | When this status was written. |
+| `phase` | string | `start` → `top-scan-start` → `top-scan` / `measuring` → `top-scan-done` → `done` (or `stopped` / `paused`). |
+| `current` | string | Directory currently being measured (empty outside a measurement). |
+| `itemsDone` | int | Top-level directories completed. |
+| `itemsTotal` | int | Total top-level directories to scan. |
+| `bytesCounted` | int | Running byte total for the current measured directory (tracked path only). |
+| `filesCounted` | int | Running file count for the current measured directory (tracked path only). |
+| `elapsedSeconds` | float | Seconds since `startTime`. |
+| `message` | string | Human-readable status. |
+
+### `out.json` — machine-readable run result (`-JsonReport`)
+
+Written after the markdown report is emitted (or skipped on early stop).
+
+```json
+{
+  "summary": {
+    "topN": 2,
+    "root": "C:\",
+    "host": "COV-ROG",
+    "date": "2026-09-04T04:52:54.0000000-04:00"
+  },
+  "topConsumers": [
+    { "name": "Windows", "sizeMB": 24530.12 },
+    { "name": "Users",   "sizeMB":  18432.55 }
+  ],
+  "cleanupCandidates": [
+    { "label": "User TEMP (C:\\Users\\folar\\AppData\\Local\\Temp)", "mb": 1024.5, "present": true },
+    { "label": "Recycle Bin", "mb": 0, "present": false }
+  ],
+  "grandTotalMB": 48210.77,
+  "stopped": false
+}
+```
+
+### Worked example: external process drives a scan
+
+```bash
+#!/usr/bin/env bash
+# 1. Pre-configure the run
+ROOT="C:\Coding\rivaborn\spaceanalysis"
+cat > "$ROOT/settings.json" <<'JSON'
+{"root":"C:\\","top":10,"depth":2}
+JSON
+
+# 2. Launch the scan with telemetry + JSON result
+powershell -NoProfile -ExecutionPolicy Bypass -File "$ROOT/analyze-disk.ps1" \
+  -Settings "$ROOT/settings.json" \
+  -Telemetry \
+  -StatusFile "$ROOT/status.json" \
+  -ControlFile "$ROOT/control.json" \
+  -JsonReport "$ROOT/out.json" &
+PID=$!
+
+# 3. Poll status every 2 s while running
+while kill -0 "$PID" 2>/dev/null; do
+  sleep 2
+  python3 -c "import json;d=json.load(open('$ROOT/status.json'));\" \
+            "print(d['phase'], d['current'], d['filesCounted'])"
+done
+wait "$PID"
+
+# 4. Read the result
+python3 -c "import json;d=json.load(open('$ROOT/out.json'));\" \
+           "print(d['summary'], d['grandTotalMB'], d['stopped'])"
+
+# 5. To stop mid-scan, from another terminal:
+echo '{"action":"stop"}' > "$ROOT/control.json"
+# 6. To pause and resume:
+echo '{"action":"pause"}'  > "$ROOT/control.json"
+# ... later ...
+echo '{"action":"resume"}' > "$ROOT/control.json"
+```
+
 ## Safety
 
 The script performs **no deletion or modification** of any kind. The cleanup
