@@ -16,8 +16,40 @@ param(
     [string]$Root = 'C:\',
     [int]$Top = 20,
     [string]$Output = $null,
-    [int]$Depth = 2
+    [int]$Depth = 2,
+    [switch]$Help
 )
+
+if ($Help) {
+    Write-Output @"
+analyze-disk.ps1 - review disk space usage on this system and recommend ways to free up space (read-only).
+
+Usage:
+  powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 [-Root <path>] [-Top <n>] [-Depth <n>] [-Output <file>] [-Help]
+
+Parameters:
+  -Root     Path to analyze (default: C:\)
+  -Top      Number of top-level consumers to rank and drill into (default: 20)
+  -Depth    Drill-down depth into top consumers, in levels (default: 2)
+  -Output   Write the markdown report to this file in addition to the console (default: none)
+  -Help     Show this help and exit
+
+Report sections:
+  System summary      host, PowerShell version, run date, drive free space
+  Top space consumers direct child directories of Root, ranked by recursive size
+  Drill-down          up to -Depth levels into the top consumers (bounded walk)
+  Cleanup candidates  well-known Windows waste locations with sizes and safe cleanup hints
+
+Methodology: metadata-only enumeration (file names + Length, file contents are
+never read); each analyzed directory is measured in ONE pass; only the largest
+branches are expanded, so runtime stays bounded instead of exhaustively
+scanning every directory.
+
+Safety: the script is strictly read-only. It reports and suggests; it never
+modifies or deletes anything.
+"@
+    exit 0
+}
 
 function Get-DirSize {
     <#
@@ -170,7 +202,33 @@ if (-not (Test-Path -LiteralPath $Root)) {
 $report = [System.Collections.Generic.List[string]]::new()
 $report.Add('# Disk space analysis')
 $report.Add('')
-$report.Add('Root: `' + $Root + '`')
+
+# --- System summary ---
+$report.Add('## System summary')
+$report.Add('')
+$report.Add('| Item | Value |')
+$report.Add('| --- | --- |')
+$report.Add('| Host | ' + $env:COMPUTERNAME + ' |')
+$report.Add('| PowerShell | ' + $PSVersionTable.PSVersion.ToString() + ' |')
+$report.Add('| Run date | ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' |')
+$report.Add('| Root | `' + $Root + '` |')
+$report.Add('| Top N | ' + $Top + ' |')
+$report.Add('| Drill depth | ' + $Depth + ' |')
+try {
+    $driveLetter = ($Root -split ':')[0]
+    if ($driveLetter) {
+        $disk = @(Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${driveLetter}:'" -ErrorAction SilentlyContinue)[0]
+        if ($disk -and $disk.Size) {
+            $totalGB = [math]::Round($disk.Size / 1GB, 1)
+            $usedGB  = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 1)
+            $freeGB  = [math]::Round($disk.FreeSpace / 1GB, 1)
+            $pct     = [math]::Round(100 * ($disk.Size - $disk.FreeSpace) / $disk.Size, 1)
+            $report.Add('| Drive ' + $driveLetter + ': | ' + $totalGB + ' GB total, ' + $usedGB + ' GB used (' + $pct + '%), ' + $freeGB + ' GB free |')
+        }
+    }
+} catch {}
+$report.Add('')
+$report.Add('> Read-only: this script only reports and suggests; it never modifies or deletes anything.')
 $report.Add('')
 
 # --- Ranked top space consumers (direct child directories of $Root) ---
@@ -249,4 +307,10 @@ $grandTotalBytes = $allChildrenBytes + $rootFilesBytes
 $report.Add('')
 $report.Add('Total under `' + $Root + '`: ' + (Format-MB $grandTotalBytes) + ' MB (' + $grandTotalBytes + ' bytes)')
 
-Write-Output ($report -join [System.Environment]::NewLine)
+# --- Emit report: console, and to -Output file when given ---
+$text = $report -join [System.Environment]::NewLine
+if ($Output) {
+    Set-Content -LiteralPath $Output -Value $text -Encoding utf8
+    Write-Host "Report written to $Output"
+}
+Write-Output $text
