@@ -159,6 +159,82 @@ function Get-DirSizeWalk {
     }
 }
 
+function Get-SizeTreeNode {
+    <#
+    .SYNOPSIS
+        Recursively builds an in-memory size-tree node for a directory.
+
+    .DESCRIPTION
+        Enumerates a single directory level with the .NET
+        DirectoryInfo.EnumerateFileSystemInfos iterator. Files are summed into
+        OwnBytes; subdirectories are recursed into (skipping reparse points).
+        Returns a PSCustomObject with Name, Path, OwnBytes, TotalBytes,
+        FileCount, and Children (sorted by TotalBytes descending).
+        When -Track is set, telemetry (Write-Status) and control (Read-Control)
+        checkpoints run periodically; the walk stops early once StopRequested.
+    #>
+    param(
+        [string]$Path,
+        [switch]$Track,
+        [string]$Label = ''
+    )
+
+    $reparseFlag = [int][System.IO.FileAttributes]::ReparsePoint
+    $ownBytes    = [long]0
+    $fileCount   = [long]0
+    $childNodes  = [System.Collections.Generic.List[object]]::new()
+
+    try {
+        foreach ($e in [System.IO.DirectoryInfo]::new($Path).EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
+            if ($Track -and $Script:StopRequested) { break }
+
+            if ($e -is [System.IO.FileInfo]) {
+                $len = 0L
+                try { $len = [long]$e.Length } catch {}
+                $ownBytes  += $len
+                $fileCount++
+                if ($Track) {
+                    $Script:WalkFiles++
+                    $Script:WalkBytes += $len
+                    if ($Script:WalkFiles % 5000 -eq 0) {
+                        Write-Status -Phase 'measuring' -Current $Label -Bytes $Script:WalkBytes -Files $Script:WalkFiles `
+                            -Message ("Measuring {0} : {1} files, {2} bytes" -f $Label, $Script:WalkFiles, $Script:WalkBytes)
+                    }
+                    if ($Script:WalkFiles % 20000 -eq 0) {
+                        Read-Control
+                    }
+                }
+            } else {
+                # Directory: recurse only if NOT a reparse point.
+                if (-not ([int]$e.Attributes -band $reparseFlag)) {
+                    $child = Get-SizeTreeNode -Path $e.FullName -Track:$Track -Label $e.Name
+                    $childNodes.Add($child)
+                }
+            }
+        }
+    } catch {
+        # Enumeration error: keep what we have so far.
+    }
+
+    # Sort children by TotalBytes descending (most significant first).
+    $children = @($childNodes | Sort-Object -Property TotalBytes -Descending)
+
+    $totalBytes = $ownBytes
+    foreach ($c in $children) { $totalBytes += [long]$c.TotalBytes }
+
+    $name = [System.IO.Path]::GetFileName($Path)
+    if ($name -eq '') { $name = $Path }
+
+    return [pscustomobject]@{
+        Name       = $name
+        Path       = $Path
+        OwnBytes   = $ownBytes
+        TotalBytes = $totalBytes
+        FileCount  = $fileCount
+        Children   = $children
+    }
+}
+
 function Format-MB {
     param([long]$Bytes)
     return [math]::Round($Bytes / 1MB, 2)
@@ -286,63 +362,47 @@ function Read-Control {
 }
 
 # Bounds the drill-down: at each level, at most this many children are
-# measured recursively (full size). The rest are shown with their
-# non-recursive (this-level-only) size, so runtime stays bounded.
+# expanded recursively. The rest are shown with their OwnBytes
+# (this-level-only size), so output stays bounded.
 $MAX_EXPANDED = 10
 
-function Expand-Top {
-    <#>
+function Expand-Tree {
+    <#
     .SYNOPSIS
-        Drills into a directory's child directories, one level per call,
-        descending up to $Levels total. Prints each level's children
-        sorted by size. Only the largest $MAX_EXPANDED children at each
-        level are measured recursively; the rest are sized non-recursively.
+        In-memory drill-down over a size-tree node's children.
+
     .DESCRIPTION
-        Read-only. Returns a list of report lines for this level and all
-        deeper levels (recursion happens inside).
+        Traverses the in-memory tree (no disk I/O). At each level, the top
+        $MAX_EXPANDED children (by TotalBytes) are expanded; the rest show
+        only their OwnBytes (this-level-only). Returns report lines for this
+        level and deeper levels.
     #>
     param(
-        [string]$Path,
+        $Node,
         [int]$Level,
         [int]$Levels,
         [string]$Indent
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    $kids = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue)
+    $kids = @($Node.Children)
     if ($kids.Count -eq 0) { return $lines }
 
-    # Cheap first pass: this-level-only size per child.
-    $entries = @()
-    foreach ($k in $kids) {
-        $lvl = @(Get-ChildItem -LiteralPath $k.FullName -File -Force -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
-        $entries += [pscustomobject]@{
-            Name  = $k.Name
-            Path  = $k.FullName
-            Bytes = if ($null -eq $lvl) { 0L } else { [long]$lvl }
-            Full  = $false
-        }
-    }
-    $entries = @($entries | Sort-Object -Property Bytes -Descending)
-
-    # Recurse only into the largest children, and only while levels remain.
-    $expanded = @($entries | Select-Object -First $MAX_EXPANDED)
+    # Determine which children to expand (top MAX_EXPANDED, if levels remain).
+    $expandedSet = @{}
     if ($Level -lt $Levels) {
-        foreach ($e in $expanded) {
-            $e.Full  = $true
-            $e.Bytes = Get-DirSize -Path $e.Path -Track:$Script:TelemetryOn -Label $e.Name
-        }
-        $entries = @($entries | Sort-Object -Property Bytes -Descending)
+        $expanded = @($kids | Select-Object -First $MAX_EXPANDED)
+        foreach ($e in $expanded) { $expandedSet[$e.Path] = $true }
     }
 
-    # Emit each child line immediately followed by its own subtree, so the
-    # hierarchy stays unambiguous (children of sibling dirs don't mix).
-    foreach ($e in $entries) {
-        $note = if ($e.Full) { '' } else { ' (this level only)' }
-        $lines.Add($Indent + '-' + ' `' + $e.Name + '`: ' + (Format-MB $e.Bytes) + ' MB' + $note)
-        if ($e.Full) {
-            $sub = Expand-Top -Path $e.Path -Level ($Level + 1) -Levels $Levels -Indent ($Indent + '    ')
+    foreach ($e in $kids) {
+        $isFull = $expandedSet.ContainsKey($e.Path)
+        $note = if ($isFull) { '' } else { ' (this level only)' }
+        # Expanded: show TotalBytes (full recursive). Non-expanded: show OwnBytes (this level only).
+        $displayBytes = if ($isFull) { [long]$e.TotalBytes } else { [long]$e.OwnBytes }
+        $lines.Add($Indent + '- `' + $e.Name + '`: ' + (Format-MB $displayBytes) + ' MB' + $note)
+        if ($isFull) {
+            $sub = Expand-Tree -Node $e -Level ($Level + 1) -Levels $Levels -Indent ($Indent + '    ')
             foreach ($dl in $sub) { $lines.Add($dl) }
         }
     }
@@ -476,28 +536,37 @@ $report.Add('')
 $report.Add('| Directory | Size (MB) |')
 $report.Add('| --- | ---: |')
 
-# One size measurement per top-level child; the grand total is derived from
-# these same measurements plus top-level loose files, so the tree is walked
-# exactly once in total.
-$children = @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)
-$totalDirs = $children.Count
+# Single-pass tree build: each top-level directory is walked ONCE by
+# Get-SizeTreeNode (no re-scanning for drill-down). The in-memory tree is
+# reused for ranking, drill-down, and grand total.
+$rootDirs = @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)
+$totalDirs = $rootDirs.Count
 Write-Status -Phase 'top-scan-start' -ItemsTotal $totalDirs -Message ('Scanning ' + $totalDirs + ' top-level directory(ies) under `' + $Root + '`')
-$ranked = @()
+
+# Initialize telemetry accumulators for the tree walk.
+$Script:WalkBytes = [long]0
+$Script:WalkFiles = [long]0
+
+$topNodes = @()
 $done = 0
-foreach ($child in $children) {
+foreach ($child in $rootDirs) {
     if ($Script:StopRequested) { break }
     $done++
     Write-Status -Phase 'top-scan' -Current $child.Name -ItemsDone $done -ItemsTotal $totalDirs -Message ('Measuring `' + $child.Name + '`')
-    $ranked += [pscustomobject]@{
-        Name  = $child.Name
-        Path  = $child.FullName
-        Bytes = Get-DirSize -Path $child.FullName -Track:$Script:TelemetryOn -Label $child.Name
-    }
+    $node = Get-SizeTreeNode -Path $child.FullName -Track:$Script:TelemetryOn -Label $child.Name
+    $topNodes += $node
     # Checkpoint at each directory boundary: honor stop / pause / overrides.
     Read-Control
 }
 Write-Status -Phase 'top-scan-done' -ItemsDone $done -ItemsTotal $totalDirs -Message "Top-level scan complete ($done/$totalDirs measured)"
 Read-Control
+
+# Finalize telemetry totals from the walk.
+$Script:FilesCounted = $Script:WalkFiles
+$Script:BytesCounted = $Script:WalkBytes
+
+# Rank top-level nodes by TotalBytes descending.
+$ranked = @($topNodes | Sort-Object -Property TotalBytes -Descending)
 
 # If stop was requested mid-scan, write a terminal status and exit early.
 if ($Script:StopRequested) {
@@ -506,15 +575,11 @@ if ($Script:StopRequested) {
     exit 0
 }
 
-if ($ranked.Count -gt 0) {
-    $ranked = $ranked | Sort-Object -Property Bytes -Descending
-}
-
 # Honor any control-file override of the top-N before selecting.
 $effectiveTop = if ($Script:OverrideTop -and $Script:OverrideTop -gt 0) { $Script:OverrideTop } else { $Top }
 $topN = @($ranked | Select-Object -First $effectiveTop)
 foreach ($item in $topN) {
-    $line = '| `' + $item.Name + '` | ' + (Format-MB $item.Bytes) + ' |'
+    $line = '| `' + $item.Name + '` | ' + (Format-MB $item.TotalBytes) + ' |'
     $report.Add($line)
 }
 
@@ -525,8 +590,8 @@ if ($effectiveDepth -ge 1 -and $topN.Count -gt 0) {
     $report.Add('## Drill-down (top consumers, up to ' + $effectiveDepth + ' levels)')
     $report.Add('')
     foreach ($item in $topN) {
-        $report.Add('### `' + $item.Name + '`' + ' — ' + (Format-MB $item.Bytes) + ' MB')
-        $drill = Expand-Top -Path $item.Path -Level 1 -Levels $effectiveDepth -Indent ''
+        $report.Add('### `' + $item.Name + '`' + ' — ' + (Format-MB $item.TotalBytes) + ' MB')
+        $drill = Expand-Tree -Node $item -Level 1 -Levels $effectiveDepth -Indent ''
         if ($drill.Count -eq 0) {
             $report.Add('- (no subdirectories)')
         } else {
@@ -554,15 +619,17 @@ foreach ($c in $candidates) {
 }
 $report.Add('')
 
-# Grand total = all child directories + files directly in the root.
-$allChildrenBytes = 0L
-foreach ($item in $ranked) {
-    $allChildrenBytes += [long]$item.Bytes
-}
-$rootFilesSum = @(Get-ChildItem -LiteralPath $Root -File -Force -ErrorAction SilentlyContinue |
-    Measure-Object -Property Length -Sum).Sum
-$rootFilesBytes = if ($null -eq $rootFilesSum) { 0L } else { [long]$rootFilesSum }
-$grandTotalBytes = $allChildrenBytes + $rootFilesBytes
+# Grand total = root's own files + all top-level node totals (from the tree).
+$rootOwnBytes = [long]0
+try {
+    foreach ($e in [System.IO.DirectoryInfo]::new($Root).EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
+        if ($e -is [System.IO.FileInfo]) {
+            try { $rootOwnBytes += [long]$e.Length } catch {}
+        }
+    }
+} catch {}
+$grandTotalBytes = $rootOwnBytes
+foreach ($item in $ranked) { $grandTotalBytes += [long]$item.TotalBytes }
 
 $report.Add('')
 $report.Add('Total under `' + $Root + '`: ' + (Format-MB $grandTotalBytes) + ' MB (' + $grandTotalBytes + ' bytes)')
@@ -589,7 +656,7 @@ if ($JsonReport) {
         }
         topConsumers = @($topN | ForEach-Object { [ordered]@{
             name   = $_.Name
-            sizeMB = [math]::Round([long]$_.Bytes / 1MB, 2)
+            sizeMB = [math]::Round([long]$_.TotalBytes / 1MB, 2)
         } })
         cleanupCandidates = @($candidates | ForEach-Object { [ordered]@{
             label   = $_.Label
