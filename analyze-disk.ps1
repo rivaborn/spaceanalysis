@@ -61,20 +61,59 @@ function Get-DirSize {
         Returns the recursive total size (bytes) of a directory.
 
     .DESCRIPTION
-        Single-pass, metadata-only enumeration: enumerates every file under
-        the directory and sums the Length property. File contents are never
-        read. Returns 0 for missing or inaccessible paths.
+        Two paths:
+        - Fast (default): single-pass Get-ChildItem -Recurse | Measure-Object.
+        - Trackable (-Track): walks files via EnumerateFiles in a foreach loop,
+          updating telemetry status every 5000 files and honoring the control
+          file every 20000 files. Returns bytes counted so far if stop is
+          requested. Still metadata-only; file contents are never read.
     #>
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [switch]$Track,
+        [string]$Label = ''
+    )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         return 0
     }
 
-    $sum = @(Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction SilentlyContinue |
-        Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) { return 0 }
-    return [long]$sum
+    # Fast path: metadata-only single pass, no telemetry (behavior/speed unchanged).
+    if (-not $Track) {
+        $sum = @(Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+        if ($null -eq $sum) { return 0 }
+        return [long]$sum
+    }
+
+    # Trackable path: per-file walk with periodic telemetry + control checks.
+    $bytesSoFar   = [long]0
+    $filesCounted = [long]0
+    $statusEvery  = 5000
+    $controlEvery = 20000
+
+    try {
+        foreach ($file in [System.IO.Directory]::EnumerateFiles($Path, '*', [System.IO.SearchOption]::AllDirectories)) {
+            if ($Script:StopRequested) { break }
+            try {
+                $bytesSoFar += [long]([System.IO.FileInfo]::new($file)).Length
+            } catch {}
+            $filesCounted++
+            if ($filesCounted % $statusEvery -eq 0) {
+                Write-Status -Phase 'measuring' -Current $Label -Bytes $bytesSoFar -Files $filesCounted `
+                    -Message ("Measuring {0} : {1} files, {2} bytes" -f $Label, $filesCounted, $bytesSoFar)
+            }
+            if ($filesCounted % $controlEvery -eq 0) {
+                Read-Control
+            }
+        }
+    } catch {
+        # Enumeration error (e.g. an inaccessible subtree): keep the count so far.
+    }
+
+    $Script:FilesCounted += $filesCounted
+    $Script:BytesCounted  += $bytesSoFar
+    return $bytesSoFar
 }
 
 function Format-MB {
@@ -249,7 +288,7 @@ function Expand-Top {
     if ($Level -lt $Levels) {
         foreach ($e in $expanded) {
             $e.Full  = $true
-            $e.Bytes = Get-DirSize -Path $e.Path
+            $e.Bytes = Get-DirSize -Path $e.Path -Track:$Script:TelemetryOn -Label $e.Name
         }
         $entries = @($entries | Sort-Object -Property Bytes -Descending)
     }
@@ -401,13 +440,20 @@ foreach ($child in $children) {
     $ranked += [pscustomobject]@{
         Name  = $child.Name
         Path  = $child.FullName
-        Bytes = Get-DirSize -Path $child.FullName
+        Bytes = Get-DirSize -Path $child.FullName -Track:$Script:TelemetryOn -Label $child.Name
     }
     # Checkpoint at each directory boundary: honor stop / pause / overrides.
     Read-Control
 }
 Write-Status -Phase 'top-scan-done' -ItemsDone $done -ItemsTotal $totalDirs -Message "Top-level scan complete ($done/$totalDirs measured)"
 Read-Control
+
+# If stop was requested mid-scan, write a terminal status and exit early.
+if ($Script:StopRequested) {
+    Write-Status -Phase 'stopped' -ItemsDone $done -ItemsTotal $totalDirs -Files $Script:FilesCounted -Bytes $Script:BytesCounted -Message 'stopped by control file'
+    Write-Output 'Stopped by control file; report not generated.'
+    exit 0
+}
 
 if ($ranked.Count -gt 0) {
     $ranked = $ranked | Sort-Object -Property Bytes -Descending
@@ -478,5 +524,5 @@ if ($Output) {
 }
 
 # --- Terminal heartbeat (telemetry) ---
-Write-Status -Phase 'done' -ItemsDone $done -ItemsTotal $totalDirs -Message 'Report generated.'
+Write-Status -Phase 'done' -ItemsDone $done -ItemsTotal $totalDirs -Files $Script:FilesCounted -Bytes $Script:BytesCounted -Message 'Report generated.'
 Write-Output $text
