@@ -15,7 +15,8 @@
 param(
     [string]$Root = 'C:\',
     [int]$Top = 20,
-    [string]$Output = $null
+    [string]$Output = $null,
+    [int]$Depth = 2
 )
 
 function Get-DirSize {
@@ -43,6 +44,72 @@ function Get-DirSize {
 function Format-MB {
     param([long]$Bytes)
     return [math]::Round($Bytes / 1MB, 2)
+}
+
+# Bounds the drill-down: at each level, at most this many children are
+# measured recursively (full size). The rest are shown with their
+# non-recursive (this-level-only) size, so runtime stays bounded.
+$MAX_EXPANDED = 10
+
+function Expand-Top {
+    <#>
+    .SYNOPSIS
+        Drills into a directory's child directories, one level per call,
+        descending up to $Levels total. Prints each level's children
+        sorted by size. Only the largest $MAX_EXPANDED children at each
+        level are measured recursively; the rest are sized non-recursively.
+    .DESCRIPTION
+        Read-only. Returns a list of report lines for this level and all
+        deeper levels (recursion happens inside).
+    #>
+    param(
+        [string]$Path,
+        [int]$Level,
+        [int]$Levels,
+        [string]$Indent
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $kids = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue)
+    if ($kids.Count -eq 0) { return $lines }
+
+    # Cheap first pass: this-level-only size per child.
+    $entries = @()
+    foreach ($k in $kids) {
+        $lvl = @(Get-ChildItem -LiteralPath $k.FullName -File -Force -ErrorAction SilentlyContinue |
+            Measure-Object -Property Length -Sum).Sum
+        $entries += [pscustomobject]@{
+            Name  = $k.Name
+            Path  = $k.FullName
+            Bytes = if ($null -eq $lvl) { 0L } else { [long]$lvl }
+            Full  = $false
+        }
+    }
+    $entries = @($entries | Sort-Object -Property Bytes -Descending)
+
+    # Recurse only into the largest children, and only while levels remain.
+    $expanded = @($entries | Select-Object -First $MAX_EXPANDED)
+    if ($Level -lt $Levels) {
+        foreach ($e in $expanded) {
+            $e.Full  = $true
+            $e.Bytes = Get-DirSize -Path $e.Path
+        }
+        $entries = @($entries | Sort-Object -Property Bytes -Descending)
+    }
+
+    foreach ($e in $entries) {
+        $note = if ($e.Full) { '' } else { ' (this level only)' }
+        $lines.Add($Indent + '-' + ' `' + $e.Name + '`: ' + (Format-MB $e.Bytes) + ' MB' + $note)
+    }
+
+    if ($Level -lt $Levels) {
+        foreach ($e in $expanded) {
+            foreach ($dl in (Expand-Top -Path $e.Path -Level ($Level + 1) -Levels $Levels -Indent ($Indent + '    '))) {
+                $lines.Add($dl)
+            }
+        }
+    }
+    return [string[]]$lines
 }
 
 # Validate the root before doing any work.
@@ -83,6 +150,23 @@ $topN = @($ranked | Select-Object -First $Top)
 foreach ($item in $topN) {
     $line = '| `' + $item.Name + '` | ' + (Format-MB $item.Bytes) + ' |'
     $report.Add($line)
+}
+
+# --- Drill-down into the top consumers (bounded: -Depth levels, $MAX_EXPANDED branches/level) ---
+if ($Depth -ge 1 -and $topN.Count -gt 0) {
+    $report.Add('')
+    $report.Add('## Drill-down (top consumers, up to ' + $Depth + ' levels)')
+    $report.Add('')
+    foreach ($item in $topN) {
+        $report.Add('### `' + $item.Name + '`' + ' — ' + (Format-MB $item.Bytes) + ' MB')
+        $drill = Expand-Top -Path $item.Path -Level 1 -Levels $Depth -Indent ''
+        if ($drill.Count -eq 0) {
+            $report.Add('- (no subdirectories)')
+        } else {
+            foreach ($dl in $drill) { $report.Add($dl) }
+        }
+        $report.Add('')
+    }
 }
 
 # Grand total = all child directories + files directly in the root.
