@@ -17,7 +17,11 @@ param(
     [int]$Top = 20,
     [string]$Output = $null,
     [int]$Depth = 2,
-    [switch]$Help
+    [switch]$Help,
+    [string]$Settings = $null,
+    [string]$StatusFile = 'status.json',
+    [string]$ControlFile = 'control.json',
+    [switch]$Telemetry
 )
 
 if ($Help) {
@@ -76,6 +80,127 @@ function Get-DirSize {
 function Format-MB {
     param([long]$Bytes)
     return [math]::Round($Bytes / 1MB, 2)
+}
+
+# ============================================================
+# Telemetry / control plumbing (active only with -Telemetry)
+# ============================================================
+
+function Load-Settings {
+    <#
+    .SYNOPSIS
+        Loads a run-config JSON file written by another process.
+
+    .DESCRIPTION
+        Returns a PSCustomObject if the file exists and parses, else $null.
+        Recognized keys: root, top, depth, output (jsonReport is handled
+        by a later feature).
+    #>
+    param([string]$SettingsPath)
+
+    if (-not $SettingsPath) { return $null }
+    if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $SettingsPath -Raw -ErrorAction Stop
+        return ($raw | ConvertFrom-Json)
+    } catch {
+        Write-Warning "Could not parse settings file '$SettingsPath': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Write-Status {
+    <#
+    .SYNOPSIS
+        Atomically writes the current run status as JSON to the status file.
+
+    .DESCRIPTION
+        Writes to a .tmp file, then Move-Item over the status file, so a
+        polling process always reads a complete, valid document.
+        No-op unless -Telemetry.
+    #>
+    param(
+        [string]$Phase,
+        [string]$Current = '',
+        [int]$ItemsDone = 0,
+        [int]$ItemsTotal = 0,
+        [long]$Bytes = 0,
+        [long]$Files = 0,
+        [string]$Message = ''
+    )
+
+    if (-not $Script:TelemetryOn -or -not $Script:StatusFile) { return }
+    try {
+        $elapsed = [math]::Round(([DateTime]::Now - $Script:StartTime).TotalSeconds, 1)
+        $data = [ordered]@{
+            pid            = [int]$PID
+            startTime      = $Script:StartTime.ToString('o')
+            timestamp      = [DateTime]::Now.ToString('o')
+            phase          = $Phase
+            current        = $Current
+            itemsDone      = $ItemsDone
+            itemsTotal     = $ItemsTotal
+            bytesCounted   = $Bytes
+            filesCounted   = $Files
+            elapsedSeconds = $elapsed
+            message        = $Message
+        }
+        $tmp = "$($Script:StatusFile).tmp"
+        $json = $data | ConvertTo-Json -Depth 5
+        # UTF-8 without BOM: a BOM breaks JSON parsers on the polling side.
+        [System.IO.File]::WriteAllText($tmp, $json, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tmp -Destination $Script:StatusFile -Force
+    } catch {
+        Write-Warning "Telemetry write failed: $($_.Exception.Message)"
+    }
+}
+
+function Read-Once-Control {
+    <#
+    .SYNOPSIS
+        Reads the control file once; updates stop/pause flags and overrides.
+
+    .DESCRIPTION
+        Non-blocking. Returns $true if a control file was read. No-op unless
+        -Telemetry; never errors when the file is missing.
+    #>
+    if (-not $Script:TelemetryOn -or -not $Script:ControlFile) { return $false }
+    if (-not (Test-Path -LiteralPath $Script:ControlFile -PathType Leaf)) { return $false }
+    try {
+        $ctl = (Get-Content -LiteralPath $Script:ControlFile -Raw -ErrorAction Stop | ConvertFrom-Json)
+    } catch { return $false }
+    if ($null -eq $ctl) { return $false }
+
+    switch ([string]$ctl.action) {
+        'stop'   { $Script:StopRequested   = $true }
+        'pause'  { $Script:PauseRequested  = $true }
+        'resume' { $Script:PauseRequested  = $false }
+    }
+    if ($ctl.PSObject.Properties['depth']) { $Script:OverrideDepth = [int]$ctl.depth }
+    if ($ctl.PSObject.Properties['top'])   { $Script:OverrideTop   = [int]$ctl.top }
+    return $true
+}
+
+function Wait-WhilePaused {
+    <#
+    .SYNOPSIS
+        Blocks until the control file says resume or stop (or pause clears).
+    #>
+    if (-not $Script:PauseRequested -or $Script:StopRequested) { return }
+    Write-Status -Phase 'paused' -Message 'Paused by control file; waiting for resume or stop.'
+    while ($Script:PauseRequested -and -not $Script:StopRequested) {
+        Start-Sleep -Seconds 1
+        [void](Read-Once-Control)
+    }
+}
+
+function Read-Control {
+    <#
+    .SYNOPSIS
+        Checkpoint hook: read the control file, then honor pause (blocking) / stop.
+    #>
+    [void](Read-Once-Control)
+    Wait-WhilePaused
 }
 
 # Bounds the drill-down: at each level, at most this many children are
@@ -193,11 +318,35 @@ function Find-CleanupCandidates {
     return $candidates
 }
 
+# --- Load settings file (another process can pre-configure the run) ---
+$settings = Load-Settings -SettingsPath $Settings
+if ($settings) {
+    if (-not $PSBoundParameters.ContainsKey('Root')   -and $settings.PSObject.Properties['root']   -and $settings.root)   { $Root   = [string]$settings.root }
+    if (-not $PSBoundParameters.ContainsKey('Top')    -and $settings.PSObject.Properties['top']    -and $settings.top)     { $Top    = [int]$settings.top }
+    if (-not $PSBoundParameters.ContainsKey('Depth')  -and $settings.PSObject.Properties['depth']  -and $settings.depth -ne 0) { $Depth = [int]$settings.depth }
+    if (-not $PSBoundParameters.ContainsKey('Output') -and $settings.PSObject.Properties['output'] -and $settings.output) { $Output = [string]$settings.output }
+}
+
+# --- Telemetry / control runtime state (script scope) ---
+$Script:TelemetryOn     = [bool]$Telemetry
+$Script:StatusFile      = $StatusFile
+$Script:ControlFile     = $ControlFile
+$Script:StartTime       = [DateTime]::Now
+$Script:StopRequested   = $false
+$Script:PauseRequested  = $false
+$Script:FilesCounted    = [long]0
+$Script:BytesCounted    = [long]0
+$Script:OverrideTop     = $null
+$Script:OverrideDepth   = $null
+
 # Validate the root before doing any work.
 if (-not (Test-Path -LiteralPath $Root)) {
     Write-Error "Root path not found: $Root"
     exit 1
 }
+
+# --- Start heartbeat (telemetry) ---
+Write-Status -Phase 'start' -Message ('Disk analysis starting under `' + $Root + '`')
 
 $report = [System.Collections.Generic.List[string]]::new()
 $report.Add('# Disk space analysis')
@@ -241,32 +390,46 @@ $report.Add('| --- | ---: |')
 # these same measurements plus top-level loose files, so the tree is walked
 # exactly once in total.
 $children = @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)
+$totalDirs = $children.Count
+Write-Status -Phase 'top-scan-start' -ItemsTotal $totalDirs -Message ('Scanning ' + $totalDirs + ' top-level directory(ies) under `' + $Root + '`')
 $ranked = @()
+$done = 0
 foreach ($child in $children) {
+    if ($Script:StopRequested) { break }
+    $done++
+    Write-Status -Phase 'top-scan' -Current $child.Name -ItemsDone $done -ItemsTotal $totalDirs -Message ('Measuring `' + $child.Name + '`')
     $ranked += [pscustomobject]@{
         Name  = $child.Name
         Path  = $child.FullName
         Bytes = Get-DirSize -Path $child.FullName
     }
+    # Checkpoint at each directory boundary: honor stop / pause / overrides.
+    Read-Control
 }
+Write-Status -Phase 'top-scan-done' -ItemsDone $done -ItemsTotal $totalDirs -Message "Top-level scan complete ($done/$totalDirs measured)"
+Read-Control
+
 if ($ranked.Count -gt 0) {
     $ranked = $ranked | Sort-Object -Property Bytes -Descending
 }
 
-$topN = @($ranked | Select-Object -First $Top)
+# Honor any control-file override of the top-N before selecting.
+$effectiveTop = if ($Script:OverrideTop -and $Script:OverrideTop -gt 0) { $Script:OverrideTop } else { $Top }
+$topN = @($ranked | Select-Object -First $effectiveTop)
 foreach ($item in $topN) {
     $line = '| `' + $item.Name + '` | ' + (Format-MB $item.Bytes) + ' |'
     $report.Add($line)
 }
 
-# --- Drill-down into the top consumers (bounded: -Depth levels, $MAX_EXPANDED branches/level) ---
-if ($Depth -ge 1 -and $topN.Count -gt 0) {
+# --- Drill-down into the top consumers (bounded: effective depth, $MAX_EXPANDED branches/level) ---
+$effectiveDepth = if ($Script:OverrideDepth -ne $null -and $Script:OverrideDepth -ge 0) { $Script:OverrideDepth } else { $Depth }
+if ($effectiveDepth -ge 1 -and $topN.Count -gt 0) {
     $report.Add('')
-    $report.Add('## Drill-down (top consumers, up to ' + $Depth + ' levels)')
+    $report.Add('## Drill-down (top consumers, up to ' + $effectiveDepth + ' levels)')
     $report.Add('')
     foreach ($item in $topN) {
         $report.Add('### `' + $item.Name + '`' + ' — ' + (Format-MB $item.Bytes) + ' MB')
-        $drill = Expand-Top -Path $item.Path -Level 1 -Levels $Depth -Indent ''
+        $drill = Expand-Top -Path $item.Path -Level 1 -Levels $effectiveDepth -Indent ''
         if ($drill.Count -eq 0) {
             $report.Add('- (no subdirectories)')
         } else {
@@ -310,7 +473,10 @@ $report.Add('Total under `' + $Root + '`: ' + (Format-MB $grandTotalBytes) + ' M
 # --- Emit report: console, and to -Output file when given ---
 $text = $report -join [System.Environment]::NewLine
 if ($Output) {
-    Set-Content -LiteralPath $Output -Value $text -Encoding utf8
+    [System.IO.File]::WriteAllText($Output, $text, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Report written to $Output"
 }
+
+# --- Terminal heartbeat (telemetry) ---
+Write-Status -Phase 'done' -ItemsDone $done -ItemsTotal $totalDirs -Message 'Report generated.'
 Write-Output $text
