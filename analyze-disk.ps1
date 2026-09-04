@@ -713,7 +713,8 @@ $report.Add('| --- | ---: | ---: |')
 # Single-pass tree build: each top-level directory is walked ONCE by
 # Get-SizeTreeNode (no re-scanning for drill-down). The in-memory tree is
 # reused for ranking, drill-down, and grand total.
-$rootDirs = @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)
+$reparseFlag = [int][System.IO.FileAttributes]::ReparsePoint
+$rootDirs = @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue | Where-Object { -not ([int]$_.Attributes -band $reparseFlag) })
 $totalDirs = $rootDirs.Count
 Write-Status -Phase 'top-scan-start' -ItemsTotal $totalDirs -Message ('Scanning ' + $totalDirs + ' top-level directory(ies) under `' + $Root + '`')
 
