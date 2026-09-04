@@ -5,8 +5,9 @@
 # Efficient methodology:
 #   - Enumerate filesystem METADATA only (file names + Length). File contents
 #     are never opened, so a full recursive pass is fast.
-#   - Each analyzed directory is measured in ONE pass
-#     (Get-ChildItem -File -Recurse | Measure-Object Length).
+#   - Each analyzed directory is measured in ONE pass over a .NET
+#     DirectoryInfo.EnumerateFileSystemInfos iterator (no per-object PowerShell
+#     pipeline), skipping directory reparse points (junctions / symlinks).
 #   - We rank the top consumers and (in later steps) drill into only the
 #     largest ones, instead of doing an exhaustive full-tree scan.
 #
@@ -67,12 +68,16 @@ function Get-DirSize {
         Returns the recursive total size (bytes) of a directory.
 
     .DESCRIPTION
-        Two paths:
-        - Fast (default): single-pass Get-ChildItem -Recurse | Measure-Object.
-        - Trackable (-Track): walks files via EnumerateFiles in a foreach loop,
-          updating telemetry status every 5000 files and honoring the control
-          file every 20000 files. Returns bytes counted so far if stop is
-          requested. Still metadata-only; file contents are never read.
+        Metadata-only, single pass over the whole subtree:
+        - Fast (default): enumerates each directory with the .NET
+          DirectoryInfo.EnumerateFileSystemInfos iterator (no per-object
+          PowerShell pipeline) and sums file Lengths.
+        - Trackable (-Track): the same walk also updates telemetry status every
+          5000 files and honors the control file every 20000 files, so a stop
+          aborts mid-scan (returns bytes counted so far).
+        Directory reparse points (junctions / symbolic links) are SKIPPED,
+        matching WinDirStat's default, to prevent loops and double-counting.
+        File contents are never opened.
     #>
     param(
         [string]$Path,
@@ -84,42 +89,74 @@ function Get-DirSize {
         return 0
     }
 
-    # Fast path: metadata-only single pass, no telemetry (behavior/speed unchanged).
-    if (-not $Track) {
-        $sum = @(Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
-        if ($null -eq $sum) { return 0 }
-        return [long]$sum
-    }
+    # Working accumulators for this single walk, reset per Get-DirSize call so
+    # the global Script: totals are added exactly once (never per level).
+    $Script:WalkBytes = [long]0
+    $Script:WalkFiles = [long]0
 
-    # Trackable path: per-file walk with periodic telemetry + control checks.
-    $bytesSoFar   = [long]0
-    $filesCounted = [long]0
+    [void](Get-DirSizeWalk -Path $Path -Track:$Track -Label $Label)
+
+    $bytes = [long]$Script:WalkBytes
+    $files = [long]$Script:WalkFiles
+
+    if ($Track) {
+        $Script:FilesCounted += $files
+        $Script:BytesCounted  += $bytes
+    }
+    return $bytes
+}
+
+function Get-DirSizeWalk {
+    <#
+    .SYNOPSIS
+        Recursive, metadata-only size walk over one directory level at a time.
+
+    .DESCRIPTION
+        Enumerates a single directory with the .NET
+        DirectoryInfo.EnumerateFileSystemInfos iterator (no per-object PowerShell
+        pipeline). Files add their Length to $Script:WalkBytes. Subdirectories are
+        recursed into once each, EXCEPT directory reparse points (junctions /
+        symlinks), which are skipped entirely (WinDirStat default) to avoid loops
+        and double-counting. When -Track is set, telemetry (Write-Status) and
+        control (Read-Control) checkpoints run periodically and the walk stops
+        early once StopRequested is set.
+    #>
+    param(
+        [string]$Path,
+        [switch]$Track,
+        [string]$Label = ''
+    )
+
     $statusEvery  = 5000
     $controlEvery = 20000
+    $reparseFlag  = [int][System.IO.FileAttributes]::ReparsePoint
 
     try {
-        foreach ($file in [System.IO.Directory]::EnumerateFiles($Path, '*', [System.IO.SearchOption]::AllDirectories)) {
-            if ($Script:StopRequested) { break }
-            try {
-                $bytesSoFar += [long]([System.IO.FileInfo]::new($file)).Length
-            } catch {}
-            $filesCounted++
-            if ($filesCounted % $statusEvery -eq 0) {
-                Write-Status -Phase 'measuring' -Current $Label -Bytes $bytesSoFar -Files $filesCounted `
-                    -Message ("Measuring {0} : {1} files, {2} bytes" -f $Label, $filesCounted, $bytesSoFar)
-            }
-            if ($filesCounted % $controlEvery -eq 0) {
-                Read-Control
+        foreach ($e in [System.IO.DirectoryInfo]::new($Path).EnumerateFileSystemInfos('*', [System.IO.SearchOption]::TopDirectoryOnly)) {
+            if ($Track -and $Script:StopRequested) { break }
+
+            if ($e -is [System.IO.FileInfo]) {
+                try { $Script:WalkBytes += [long]$e.Length } catch {}
+                if ($Track) {
+                    $Script:WalkFiles++
+                    if ($Script:WalkFiles % $statusEvery -eq 0) {
+                        Write-Status -Phase 'measuring' -Current $Label -Bytes $Script:WalkBytes -Files $Script:WalkFiles `
+                            -Message ("Measuring {0} : {1} files, {2} bytes" -f $Label, $Script:WalkFiles, $Script:WalkBytes)
+                    }
+                    if ($Script:WalkFiles % $controlEvery -eq 0) {
+                        Read-Control
+                    }
+                }
+            } else {
+                # Directory: recurse only if it is NOT a reparse point.
+                if (-not ([int]$e.Attributes -band $reparseFlag)) {
+                    [void](Get-DirSizeWalk -Path $e.FullName -Track:$Track -Label $Label)
+                }
             }
         }
     } catch {
         # Enumeration error (e.g. an inaccessible subtree): keep the count so far.
     }
-
-    $Script:FilesCounted += $filesCounted
-    $Script:BytesCounted  += $bytesSoFar
-    return $bytesSoFar
 }
 
 function Format-MB {
