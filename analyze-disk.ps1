@@ -110,6 +110,57 @@ function Expand-Top {
     return [string[]]$lines
 }
 
+function Find-CleanupCandidates {
+    <#
+    .SYNOPSIS
+        Scans well-known Windows waste locations and reports reclaimable sizes
+        with suggested cleanup commands.
+
+    .DESCRIPTION
+        Read-only. Checks a fixed list of known waste locations. For each,
+        reports whether it exists, its size, and a suggested safe cleanup
+        command hint. Missing locations are reported as 'not present'.
+        The script itself performs NO deletion.
+    #>
+    param()
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+
+    $locations = @(
+        @{ Path = $env:TEMP; Label = "User TEMP ($($env:TEMP))"; Hint = "Remove-Item -LiteralPath `$env:TEMP\* -Recurse -Force" },
+        @{ Path = 'C:\Windows\Temp'; Label = 'Windows Temp'; Hint = "Remove-Item -Path 'C:\Windows\Temp\*' -Recurse -Force" },
+        @{ Path = 'C:\$Recycle.Bin'; Label = 'Recycle Bin'; Hint = 'Clear-RecycleBin -DriveLetter C' },
+        @{ Path = 'C:\Windows\SoftwareDistribution\Download'; Label = 'Windows Update download cache'; Hint = "Remove-Item -Path 'C:\Windows\SoftwareDistribution\Download\*' -Recurse -Force" },
+        @{ Path = 'C:\Windows\Installer'; Label = 'Windows Installer'; Hint = "Run 'cleanmgr' (Disk Cleanup) to reclaim Installer cache" },
+        @{ Path = "$env:LOCALAPPDATA\pip\Cache"; Label = 'pip cache'; Hint = "Remove-Item -Path `"$env:LOCALAPPDATA\pip\Cache\*`" -Recurse -Force" },
+        @{ Path = "$env:LOCALAPPDATA\npm-cache"; Label = 'npm cache'; Hint = 'npm cache clean --force' },
+        @{ Path = "$env:LOCALAPPDATA\NuGet\v3-cache"; Label = 'NuGet cache'; Hint = "Remove-Item -Path `"$env:LOCALAPPDATA\NuGet\v3-cache\*`" -Recurse -Force" }
+    )
+
+    foreach ($loc in $locations) {
+        if (Test-Path -LiteralPath $loc.Path -PathType Container) {
+            $size = Get-DirSize -Path $loc.Path
+            $candidates.Add([pscustomobject]@{
+                Present = $true
+                Label   = $loc.Label
+                Path    = $loc.Path
+                Bytes   = $size
+                Hint    = $loc.Hint
+            })
+        } else {
+            $candidates.Add([pscustomobject]@{
+                Present = $false
+                Label   = $loc.Label
+                Path    = $loc.Path
+                Bytes   = 0
+                Hint    = $loc.Hint
+            })
+        }
+    }
+
+    return $candidates
+}
+
 # Validate the root before doing any work.
 if (-not (Test-Path -LiteralPath $Root)) {
     Write-Error "Root path not found: $Root"
@@ -166,6 +217,24 @@ if ($Depth -ge 1 -and $topN.Count -gt 0) {
         $report.Add('')
     }
 }
+
+# --- Cleanup candidates (well-known Windows waste locations) ---
+$report.Add('')
+$report.Add('## Cleanup candidates')
+$report.Add('')
+$report.Add('> This script is read-only and performs NO deletion. The hints below are suggestions only.')
+$report.Add('')
+
+$candidates = Find-CleanupCandidates
+foreach ($c in $candidates) {
+    if ($c.Present) {
+        $report.Add('- **' + $c.Label + '**: ' + (Format-MB $c.Bytes) + ' MB')
+        $report.Add('  Suggested cleanup: `' + $c.Hint + '`')
+    } else {
+        $report.Add('- **' + $c.Label + '**: not present')
+    }
+}
+$report.Add('')
 
 # Grand total = all child directories + files directly in the root.
 $allChildrenBytes = 0L
