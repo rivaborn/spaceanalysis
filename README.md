@@ -5,8 +5,9 @@ ways to free up space. It is a PowerShell script that is **strictly
 read-only**: it reports sizes and suggests cleanups, but never modifies or
 deletes anything. The methodology is WinDirStat-inspired: a single-pass,
 metadata-only tree walk with reparse-point (junction/symlink) skipping,
-dual logical/physical (allocated) size reporting, and optional parallel
-scanning of top-level branches.
+dual logical/physical (allocated) size reporting, and optional multithreaded
+scanning. The walk itself runs in a small compiled .NET scanner so that a
+whole-drive pass finishes in seconds rather than minutes.
 
 ## What it produces
 
@@ -24,9 +25,10 @@ A single cohesive markdown report with four sections:
    recursively are marked `(this level only)`. No disk re-scan is performed.
 4. **Cleanup candidates** — well-known Windows waste locations (user TEMP,
    Windows Temp, Recycle Bin, Windows Update download cache, Windows
-   Installer, pip/npm/NuGet caches) with their reclaimable size and a
-   suggested safe cleanup command. Missing locations are reported as
-   `not present`.
+   Installer, pip/npm/NuGet caches) with their reclaimable logical and
+   physical size and a suggested safe cleanup command. Missing locations are
+   reported as `not present`. This scan costs a few seconds regardless of
+   `-Root`; pass `-SkipCleanup` to omit it when only the tree matters.
 
 The report is printed to the console and, when `-Output` is given, also
 written to that file (UTF-8).
@@ -40,10 +42,22 @@ WinDirStat-inspired, single-pass approach:
   `DirectoryInfo.EnumerateFileSystemInfos` iterator (no per-object PowerShell
   pipeline). File contents are never opened, so a recursive pass is just a
   metadata walk — orders of magnitude faster than reading data.
+- **Compiled walk.** The recursive walk lives in a C# type (`DiskScan.Scanner`)
+  compiled once at startup with `Add-Type`, so the per-file
+  `GetCompressedFileSizeW` lookup is a direct P/Invoke instead of a PowerShell
+  function call. This is where most of the speed comes from. If `Add-Type`
+  cannot compile (no C# compiler on the host), the script warns once and falls
+  back to an equivalent PowerShell walk that produces identical numbers, just
+  slower. Set `ANALYZE_DISK_NO_FASTSCAN=1` to force the fallback — the test
+  suite uses this to check the two paths agree.
 - **Single-pass tree (scan-once).** Each top-level directory is walked exactly
   once, building an in-memory tree of nodes (Name, Path, OwnBytes, TotalBytes,
   TotalAllocBytes, FileCount, Children). Ranking, drill-down, and the grand
   total all read from this tree — no disk re-scans.
+- **Bounded memory.** Child lists deeper than the drill-down can reach
+  (`-Depth` + 1 levels) are dropped as the tree is built. Every total stays
+  exact; only detail that would never be printed is discarded, so scanning a
+  drive with millions of directories does not balloon the working set.
 - **Reparse-point / junction skipping.** Directory reparse points (junctions
   and symbolic links) are skipped, matching WinDirStat's default, to prevent
   loops and double-counting. This applies at every level of the tree, including
@@ -58,10 +72,18 @@ WinDirStat-inspired, single-pass approach:
   to `-Depth` levels. Smaller branches are shown with a cheap
   non-recursive size. This finds the big space hogs without an exhaustive
   full-tree scan, keeping runtime bounded.
-- **Optional parallel scanning (`-Parallel`).** Top-level branches are walked
-  concurrently in an in-process runspace pool
-  (`[System.Management.Automation.Runspaces]`), mirroring WinDirStat's
-  multithreading. The merged result is byte-identical to the serial scan.
+- **Parallel scanning by default.** Mirrors WinDirStat's multithreading.
+  Top-level branches are walked concurrently, *and* the first
+  few levels inside each branch fan out too — branch-level parallelism alone
+  achieves little on a real disk, where one branch dominates and the other
+  workers finish early and idle. Worker count is one per core, capped at 8.
+  The result is identical to the serial scan: children are collected by
+  discovery index and sorted with a path tiebreak, so equal-sized siblings
+  always come out in the same order. Pass `-Serial` to opt out (about 2.5x
+  slower on a whole drive, but minimal I/O pressure); `-Parallel` is still
+  accepted for compatibility, and `-Parallel:$false` / settings
+  `"parallel": false` also mean serial (note `powershell -File` in 5.1 cannot
+  pass `$false` to a switch — use `-Serial` on the command line).
 
 ## Usage
 
@@ -73,39 +95,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 `
   -Root 'C:\Users\folar' -Top 10 -Depth 3 -Output .\report.md
 
-# Parallel scan of top-level branches
+# One directory at a time (multithreaded scanning is the default)
 powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 `
-  -Root 'C:\' -Top 20 -Depth 2 -Parallel
+  -Root 'C:\' -Top 20 -Depth 2 -Serial
 
 # Show help
 powershell -NoProfile -ExecutionPolicy Bypass -File analyze-disk.ps1 -Help
 ```
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `-Root` | `C:\` | Path to analyze. |
-| `-Top` | `20` | Number of top-level consumers to rank and drill into. |
-| `-Depth` | `2` | Drill-down depth into top consumers, in levels. |
-| `-Output` | none | Also write the markdown report to this file. |
-| `-Parallel` | off | Scan top-level branches concurrently via an in-process runspace pool. |
-| `-Help` | | Print usage and exit. |
+| Parameter      | Default | Description                                                                                                     |
+| -------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `-Root`        | `C:\`   | Directory to analyze. Must exist and be a directory; anything else exits 1.                                     |
+| `-Top`         | `20`    | Number of top-level consumers to rank and drill into.                                                           |
+| `-Depth`       | `2`     | Drill-down depth into top consumers, in levels.                                                                 |
+| `-Output`      | none    | Also write the markdown report to this file.                                                                    |
+| `-Parallel`    | **on**  | Scan concurrently (top-level branches and the first levels within each). On by default; kept for compatibility. |
+| `-Serial`      | off     | Scan one directory at a time. Slower; identical results.                                                        |
+| `-SkipCleanup` | off     | Skip the cleanup-candidates scan; the report section notes the skip.                                            |
+| `-Help`        |         | Print usage and exit.                                                                                           |
 
 ## CLI / automation
 
-Besides the basic scan parameters, the script exposes four parameters that let
-an external process pre-configure or observe a run through plain JSON files on
-the filesystem. No pipes, sockets, or daemons are needed — the script is a
-single-shot, single-threaded process, so file-based JSON is the natural IPC.
+Besides the basic scan parameters, the script exposes five parameters that let
+an external process pre-configure, observe, and steer a run through plain JSON
+files on the filesystem. No pipes, sockets, or daemons are needed — the script
+is a single-shot process, so file-based JSON is the natural IPC.
 
 ### Parameters
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `-Settings <json>` | none | Path to a JSON run-config file (see schema below). CLI parameters take precedence over settings-file values. |
-| `-StatusFile <json>` | `status.json` | Where the script writes live telemetry (see schema below). Written **only** when `-Telemetry` is set. |
-| `-ControlFile <json>` | `control.json` | Where an external process writes control actions (see schema below). Read **only** when `-Telemetry` is set. |
-| `-Telemetry` | off | Switch. When set, the script writes the status file and polls the control file at directory boundaries and every 20 000 files during a scan. |
-| `-JsonReport <file>` | none | Path for a machine-readable JSON run result (see schema below). Written after the markdown report is emitted. |
+| Parameter             | Default        | Description                                                                                                                                                                                                                               |
+| --------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-Settings <json>`    | none           | Path to a JSON run-config file (see schema below). CLI parameters take precedence over settings-file values.                                                                                                                              |
+| `-StatusFile <json>`  | `status.json`  | Where the script writes live telemetry (see schema below). Written **only** when `-Telemetry` is set.                                                                                                                                     |
+| `-ControlFile <json>` | `control.json` | Where an external process writes control actions (see schema below). Read **only** when `-Telemetry` is set.                                                                                                                              |
+| `-Telemetry`          | off            | Switch. When set, the scan runs on a background thread while the main thread writes the status file and polls the control file about four times a second, so `stop`/`pause` take effect mid-directory rather than at the next checkpoint. |
+| `-JsonReport <file>`  | none           | Path for a machine-readable JSON run result (see schema below). Written on both the normal and the early-stop path.                                                                                                                       |
 
 ### `settings.json` — run configuration
 
@@ -115,38 +139,49 @@ ignored (CLI wins).
 
 ```json
 {
-  "root":  "C:\",
-  "top":   20,
-  "depth": 2,
-  "output": "C:\reports\disk.md"
+  "root":       "C:\\",
+  "top":        20,
+  "depth":      2,
+  "output":     "C:\\reports\\disk.md",
+  "jsonReport": "C:\\reports\\disk.json",
+  "serial":      false,
+  "telemetry":   false,
+  "skipCleanup": false
 }
 ```
 
-| Key | Type | Notes |
-| --- | --- | --- |
-| `root` | string | Path to analyze. Must exist. |
-| `top` | int | Number of top-level consumers. |
-| `depth` | int | Drill-down depth. `0` disables drill-down. |
-| `output` | string | Extra output path for the markdown report. |
+| Key           | Type   | Notes                                                                  |
+| ------------- | ------ | ---------------------------------------------------------------------- |
+| `root`        | string | Directory to analyze. Must exist.                                      |
+| `top`         | int    | Number of top-level consumers.                                         |
+| `depth`       | int    | Drill-down depth. `0` disables drill-down.                             |
+| `output`      | string | Extra output path for the markdown report.                             |
+| `jsonReport`  | string | Path for the machine-readable run result.                              |
+| `statusFile`  | string | Path for the telemetry status file.                                    |
+| `controlFile` | string | Path the script polls for control actions.                             |
+| `telemetry`   | bool   | Enable telemetry + control polling.                                    |
+| `serial`      | bool   | Scan one directory at a time (the multithreaded scan is the default).  |
+| `parallel`    | bool   | Legacy pre-default knob, still honored; `serial` wins if both are set. |
+| `skipCleanup` | bool   | Skip the cleanup-candidates scan.                                      |
 
-`jsonReport` is **not** read from settings.json; use the `-JsonReport` CLI
-flag instead.
+Every parameter the CLI can set is also settable here, and the CLI always
+wins for any parameter it names.
 
 ### `control.json` — actions (written by an external process)
 
-The script reads this file at every top-level directory boundary and every
-20 000 files during a tracked scan. It is non-blocking: the script never
+During a scan the script polls this file about four times a second; between
+phases it re-reads it at each boundary. It is non-blocking: the script never
 waits for the file to exist.
 
 ```json
 { "action": "stop" }
 ```
 
-| `action` value | Effect |
-| --- | --- |
-| `stop` | Script writes a terminal `stopped` status and exits early (code 0). No report is generated. |
-| `pause` | Script blocks, polling every 1 s, until the file says `resume` or `stop`. |
-| `resume` | Clears the pause; script continues. |
+| `action` value | Effect                                                                                                                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stop`         | Script writes a terminal `stopped` status and exits early (code 0). The markdown report is not generated, but `-JsonReport` is still written with `"stopped": true` and the partial totals. |
+| `pause`        | Script blocks, polling every 1 s, until the file says `resume` or `stop`.                                                                                                                   |
+| `resume`       | Clears the pause; script continues.                                                                                                                                                         |
 
 The file may also carry optional overrides (applied when the key is present):
 
@@ -154,10 +189,10 @@ The file may also carry optional overrides (applied when the key is present):
 { "action": "pause", "depth": 3, "top": 5 }
 ```
 
-| Key | Type | Effect |
-| --- | --- | --- |
-| `depth` | int | Overrides drill-down depth for the remainder of the run. |
-| `top` | int | Overrides the top-N count. |
+| Key     | Type | Effect                                                   |
+| ------- | ---- | -------------------------------------------------------- |
+| `depth` | int  | Overrides drill-down depth for the remainder of the run. |
+| `top`   | int  | Overrides the top-N count.                               |
 
 Delete or truncate the file to reset; the script simply skips missing or
 empty files.
@@ -183,39 +218,42 @@ partial document. Only written when `-Telemetry` is set.
 }
 ```
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `pid` | int | PID of the PowerShell process. |
-| `startTime` | string (ISO 8601) | When the run started. |
-| `timestamp` | string (ISO 8601) | When this status was written. |
-| `phase` | string | `start` → `top-scan-start` → `top-scan` / `measuring` → `top-scan-done` → `done` (or `stopped` / `paused`). |
-| `current` | string | Directory currently being measured (empty outside a measurement). |
-| `itemsDone` | int | Top-level directories completed. |
-| `itemsTotal` | int | Total top-level directories to scan. |
-| `bytesCounted` | int | Running byte total for the current measured directory (tracked path only). |
-| `filesCounted` | int | Running file count for the current measured directory (tracked path only). |
-| `elapsedSeconds` | float | Seconds since `startTime`. |
-| `message` | string | Human-readable status. |
+| Field            | Type              | Notes                                                                                                                        |
+| ---------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `pid`            | int               | PID of the PowerShell process.                                                                                               |
+| `startTime`      | string (ISO 8601) | When the run started.                                                                                                        |
+| `timestamp`      | string (ISO 8601) | When this status was written.                                                                                                |
+| `phase`          | string            | `start` → `top-scan-start` → `top-scan` / `measuring` → `top-scan-done` → `cleanup-scan` → `done` (or `stopped` / `paused`). |
+| `current`        | string            | Directory currently being measured (empty outside a measurement).                                                            |
+| `itemsDone`      | int               | Top-level directories completed.                                                                                             |
+| `itemsTotal`     | int               | Total top-level directories to scan.                                                                                         |
+| `bytesCounted`   | int               | Running byte total across everything measured so far this run.                                                               |
+| `filesCounted`   | int               | Running file count across everything measured so far this run.                                                               |
+| `elapsedSeconds` | float             | Seconds since `startTime`.                                                                                                   |
+| `message`        | string            | Human-readable status.                                                                                                       |
 
 ### `out.json` — machine-readable run result (`-JsonReport`)
 
-Written after the markdown report is emitted (or skipped on early stop).
+Written after the markdown report is emitted, and also on the early-stop path
+so a driver always has a document to read — check `stopped` to tell the two
+apart. On a stopped run `cleanupCandidates` is empty and the totals are
+partial.
 
 ```json
 {
   "summary": {
     "topN": 2,
-    "root": "C:\",
+    "root": "C:\\",
     "host": "COV-ROG",
     "date": "2026-09-04T04:52:54.0000000-04:00"
   },
   "topConsumers": [
     { "name": "Windows", "sizeMB": 24530.12, "allocMB": 23901.4 },
-    { "name": "Users",   "sizeMB":  18432.55, "allocMB": 18102.3 }
+    { "name": "Users",   "sizeMB": 18432.55, "allocMB": 18102.3 }
   ],
   "cleanupCandidates": [
-    { "label": "User TEMP (C:\\Users\\folar\\AppData\\Local\\Temp)", "mb": 1024.5, "present": true },
-    { "label": "Recycle Bin", "mb": 0, "present": false }
+    { "label": "User TEMP (C:\\Users\\folar\\AppData\\Local\\Temp)", "mb": 1024.5, "allocMB": 1020.1, "present": true },
+    { "label": "Recycle Bin", "mb": 0, "allocMB": 0, "present": false }
   ],
   "grandTotalMB": 48210.77,
   "grandTotalAllocMB": 47500.3,
@@ -245,14 +283,12 @@ PID=$!
 # 3. Poll status every 2 s while running
 while kill -0 "$PID" 2>/dev/null; do
   sleep 2
-  python3 -c "import json;d=json.load(open('$ROOT/status.json'));\" \
-            "print(d['phase'], d['current'], d['filesCounted'])"
+  python3 -c "import json; d = json.load(open('$ROOT/status.json')); print(d['phase'], d['current'], d['filesCounted'])" 2>/dev/null
 done
 wait "$PID"
 
 # 4. Read the result
-python3 -c "import json;d=json.load(open('$ROOT/out.json'));\" \
-           "print(d['summary'], d['grandTotalMB'], d['stopped'])"
+python3 -c "import json; d = json.load(open('$ROOT/out.json')); print(d['summary'], d['grandTotalMB'], d['stopped'])"
 
 # 5. To stop mid-scan, from another terminal:
 echo '{"action":"stop"}' > "$ROOT/control.json"
@@ -261,6 +297,23 @@ echo '{"action":"pause"}'  > "$ROOT/control.json"
 # ... later ...
 echo '{"action":"resume"}' > "$ROOT/control.json"
 ```
+
+## Tests
+
+`tests/analyze-disk.tests.ps1` is a self-contained harness (no Pester). It
+builds synthetic fixtures under `%TEMP%`, runs the script as a child process,
+asserts on the markdown and JSON output, and cleans up after itself.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/analyze-disk.tests.ps1
+```
+
+It exits 0 when every check passes, 1 otherwise. Coverage: single-pass
+aggregation, junction skipping, drill-down breadth/depth bounds,
+physical-vs-logical reporting, parallel-equals-serial, telemetry and control
+stop, settings-file precedence, root validation, compiled-scanner-equals-
+fallback, deterministic ordering of equal-sized siblings, and cleanup-candidate
+sizes.
 
 ## Safety
 
